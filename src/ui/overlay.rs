@@ -89,6 +89,12 @@ impl Overlay {
         self.window.hide();
     }
 
+    /// Fully destroy the overlay window so it disappears immediately
+    /// (not just hidden — the layer-shell surface is torn down).
+    pub fn destroy(&self) {
+        self.window.destroy();
+    }
+
     pub fn window(&self) -> &Window {
         &self.window
     }

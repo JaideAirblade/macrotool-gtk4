@@ -154,6 +154,16 @@ impl MainWindow {
         }
         self.engine.reload_profile();
     }
+
+    /// Destroy the overlay so it disappears immediately on exit.
+    pub fn close(&self) {
+        self.overlay.destroy();
+    }
+
+    /// Get the overlay window (for external shutdown wiring).
+    pub fn overlay_window(&self) -> gtk4::Window {
+        self.overlay.window().clone()
+    }
 }
 
 fn append_tab(notebook: &Notebook, label: &str, content: &gtk4::Widget) {
