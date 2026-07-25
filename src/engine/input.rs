@@ -485,6 +485,27 @@ fn handle_hotkey_key(state: &HookSharedState, key_name: &str, is_down: bool) -> 
         .lock()
         .insert(key_name.clone(), is_down);
 
+    // ── EMERGENCY STOP ──────────────────────────────────────────────
+    // Ctrl+Shift+Escape always kills all macros, regardless of config.
+    // This is hardcoded so it works even if the toggle key is broken.
+    // We check physical_down for all three keys being pressed.
+    {
+        let pd = state.physical_down.lock();
+        let ctrl = *pd.get("ctrl").unwrap_or(&false) || *pd.get("control").unwrap_or(&false);
+        let shift = *pd.get("shift").unwrap_or(&false);
+        let esc = *pd.get("escape").unwrap_or(&false);
+        if ctrl && shift && esc && is_down {
+            log::warn!("[input] EMERGENCY STOP: Ctrl+Shift+Esc pressed — killing all macros");
+            state.paused.store(true, Ordering::Release);
+            drop(pd);
+            // Clear all hotkey states
+            for hk in state.hotkeys.lock().values() {
+                hk.set_state(HotkeyState::Idle);
+            }
+            return false; // let the Esc through too
+        }
+    }
+
     let hotkeys = state.hotkeys.lock();
     let hk = match hotkeys.get(&key_name) {
         Some(h) => h.clone(),

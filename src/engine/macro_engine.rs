@@ -224,7 +224,7 @@ fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHan
     let max_duration = if m.max_hold_duration > 0 {
         Duration::from_secs(m.max_hold_duration as u64)
     } else {
-        Duration::from_secs(300) // safety timeout
+        Duration::from_secs(60) // safety timeout — 60s max per hold/toggle cycle
     };
 
     loop {

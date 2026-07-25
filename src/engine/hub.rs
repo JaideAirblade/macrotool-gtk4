@@ -110,12 +110,35 @@ impl EngineHub {
         let cfg_toggle = self.cfg.clone();
         let macros_toggle = self.macros.clone();
         let enabled_flag = self.macro_enabled.clone();
+        let input_for_toggle = self.input.clone();
         std::thread::Builder::new()
             .name("toggle-key".into())
             .spawn(move || {
                 let mut was_down = false;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(50));
+
+                    // ── Emergency stop: Ctrl+Shift+Esc ──
+                    // Checked here too (not just in the input hook) so it works
+                    // even if the input hooks are dead/stuck. This is the
+                    // fail-safe that prevents runaway macros.
+                    if input_for_toggle.is_hotkey_physically_down("ctrl")
+                        && input_for_toggle.is_hotkey_physically_down("shift")
+                        && input_for_toggle.is_hotkey_physically_down("escape")
+                    {
+                        if !was_down {
+                            // Only trigger once per press, not every 50ms
+                        }
+                        if !enabled_flag.load(Ordering::Acquire) {
+                            // Already stopped — don't re-trigger
+                        } else {
+                            log::warn!("[hub] EMERGENCY STOP via toggle-key loop");
+                            enabled_flag.store(false, Ordering::Release);
+                            macros_toggle.set_paused(true);
+                        }
+                        // Don't process the toggle key while emergency-stopping
+                        continue;
+                    }
 
                     let key = cfg_toggle.settings().toggle_key;
                     let vk = platform::name_to_vk(&key);
