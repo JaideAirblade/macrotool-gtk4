@@ -39,6 +39,10 @@ impl Overlay {
         }
 
         window.set_decorated(false);
+        // Tag the window so we can scope its surface background to
+        // transparent — otherwise the rounded .ovl-root corners sit on an
+        // opaque black square (the window's own background).
+        window.add_css_class("ovl-window");
 
         // Inject overlay CSS
         let provider = CssProvider::new();
@@ -284,12 +288,26 @@ fn render_into(content: &GtkBox, cfg: &Arc<config::Manager>, engine: &Arc<engine
 }
 
 const OVERLAY_CSS: &str = "
+/* Theme-aware overlay — uses the desktop GTK theme's own colors.
+ * Fallback colors first (in case a theme variable is missing), then the
+ * @theme_*/@accent_* variable, so it follows light/dark and any scheme. */
+
+/* The window surface itself must be transparent or the rounded .ovl-root
+ * corners render on an opaque black square. */
+.ovl-window, .ovl-window.background {
+    background: transparent;
+    background-color: transparent;
+}
+
 .ovl-root {
-    background: alpha(#1a1a2e, 0.85);
+    background: alpha(#1e1e2e, 0.88);
+    background: alpha(@theme_bg_color, 0.88);
     border-radius: 12px;
     border: 1px solid alpha(#ffffff, 0.12);
+    border: 1px solid alpha(@theme_fg_color, 0.15);
     padding: 10px 14px;
     color: #e0e0e0;
+    color: @theme_fg_color;
     box-shadow: 0 4px 20px alpha(#000000, 0.4);
 }
 
@@ -299,10 +317,12 @@ const OVERLAY_CSS: &str = "
 
 .ovl-dot-on {
     color: #50fa7b;
+    color: @success_color;
     font-size: 14px;
 }
 .ovl-dot-off {
     color: #ff5555;
+    color: @error_color;
     font-size: 14px;
 }
 
@@ -310,6 +330,7 @@ const OVERLAY_CSS: &str = "
     font-weight: bold;
     font-size: 13px;
     color: #f8f8f2;
+    color: @theme_fg_color;
 }
 
 .ovl-section {
@@ -320,6 +341,7 @@ const OVERLAY_CSS: &str = "
 .ovl-section-label {
     font-size: 9px;
     color: alpha(#ffffff, 0.45);
+    color: alpha(@theme_fg_color, 0.45);
     text-transform: uppercase;
     letter-spacing: 1px;
     margin-bottom: 2px;
@@ -331,30 +353,36 @@ const OVERLAY_CSS: &str = "
 
 .ovl-key {
     background: alpha(#ffffff, 0.1);
+    background: alpha(@theme_fg_color, 0.12);
     border-radius: 4px;
     padding: 1px 6px;
     font-size: 10px;
     font-weight: bold;
     color: alpha(#ffffff, 0.6);
+    color: alpha(@theme_fg_color, 0.65);
     min-width: 20px;
 }
 .ovl-key-on {
     background: #bd93f9;
+    background: @theme_selected_bg_color;
     border-radius: 4px;
     padding: 1px 6px;
     font-size: 10px;
     font-weight: bold;
     color: #1a1a2e;
+    color: @theme_selected_fg_color;
     min-width: 20px;
 }
 
 .ovl-macro-name {
     font-size: 11px;
     color: #f8f8f2;
+    color: @theme_fg_color;
 }
 
 .ovl-running {
     color: #50fa7b;
+    color: @success_color;
     font-size: 10px;
 }
 
@@ -365,6 +393,7 @@ const OVERLAY_CSS: &str = "
 .ovl-buff-name {
     font-size: 10px;
     color: #f8f8f2;
+    color: @theme_fg_color;
     min-width: 55px;
 }
 
@@ -373,21 +402,25 @@ const OVERLAY_CSS: &str = "
 }
 .ovl-bar trough {
     background: alpha(#ffffff, 0.1);
+    background: alpha(@theme_fg_color, 0.12);
     border-radius: 3px;
 }
 .ovl-bar progress {
     background: #bd93f9;
+    background: @theme_selected_bg_color;
     border-radius: 3px;
 }
 
 .ovl-buff-time {
     font-size: 10px;
     color: alpha(#ffffff, 0.5);
+    color: alpha(@theme_fg_color, 0.5);
     min-width: 28px;
 }
 
 .ovl-warn {
     color: #ffb86c;
+    color: @warning_color;
     font-size: 10px;
     margin-top: 2px;
 }

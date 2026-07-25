@@ -26,15 +26,16 @@ use crate::ui::procs_tab::ProcsTab;
 use crate::ui::settings_tab::SettingsTab;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::overlay::Overlay;
+use std::rc::Rc;
 
 pub struct MainWindow {
     window: ApplicationWindow,
     cfg: Arc<config::Manager>,
     engine: Arc<engine::EngineHub>,
-    sidebar: Sidebar,
-    macros_tab: MacrosTab,
-    procs_tab: ProcsTab,
-    buffs_tab: BuffsTab,
+    sidebar: Rc<Sidebar>,
+    macros_tab: Rc<MacrosTab>,
+    procs_tab: Rc<ProcsTab>,
+    buffs_tab: Rc<BuffsTab>,
     settings_tab: SettingsTab,
     overlay: Overlay,
 }
@@ -69,17 +70,30 @@ impl MainWindow {
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(false);
 
-        // Sidebar
-        let sidebar = Sidebar::new(cfg.clone(), engine.clone());
-
-        // Notebook with 4 tabs
+        // Notebook with 4 tabs (created before the sidebar so the sidebar's
+        // on_changed callback can refresh them)
         let notebook = Notebook::new();
         notebook.set_tab_pos(gtk4::PositionType::Top);
 
-        let macros_tab = MacrosTab::new(cfg.clone(), engine.clone());
-        let procs_tab = ProcsTab::new(cfg.clone(), engine.clone());
-        let buffs_tab = BuffsTab::new(cfg.clone(), engine.clone());
+        let macros_tab = Rc::new(MacrosTab::new(cfg.clone(), engine.clone()));
+        let procs_tab = Rc::new(ProcsTab::new(cfg.clone(), engine.clone()));
+        let buffs_tab = Rc::new(BuffsTab::new(cfg.clone(), engine.clone()));
         let settings_tab = SettingsTab::new(cfg.clone(), engine.clone());
+
+        // Sidebar — on_changed refreshes the tabs + sidebar after any
+        // selection/rename/add/delete
+        let sidebar = Rc::new(Sidebar::new(cfg.clone(), engine.clone(), {
+            let cfg = cfg.clone();
+            let engine = engine.clone();
+            let macros_tab = macros_tab.clone();
+            let procs_tab = procs_tab.clone();
+            let buffs_tab = buffs_tab.clone();
+            Rc::new(move || {
+                macros_tab.refresh(&cfg, &engine);
+                procs_tab.refresh(&cfg, &engine);
+                buffs_tab.refresh(&cfg, &engine);
+            })
+        }));
 
         append_tab(&notebook, "Macros", macros_tab.widget());
         append_tab(&notebook, "Pixel Triggers", procs_tab.widget());
@@ -141,9 +155,10 @@ impl MainWindow {
     }
 
     pub fn refresh(&self) {
-        self.macros_tab.refresh(&self.cfg);
-        self.procs_tab.refresh(&self.cfg);
-        self.buffs_tab.refresh(&self.cfg);
+        self.macros_tab.refresh(&self.cfg, &self.engine);
+        self.procs_tab.refresh(&self.cfg, &self.engine);
+        self.buffs_tab.refresh(&self.cfg, &self.engine);
+        self.sidebar.refresh();
     }
 
     pub fn save_and_reload(&self) {
