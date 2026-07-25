@@ -69,7 +69,7 @@ impl Overlay {
         let cfg_t = cfg.clone();
         let engine_t = engine.clone();
         let content_t = ov.content.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             render_into(&content_t, &cfg_t, &engine_t);
             glib::ControlFlow::Continue
         });
