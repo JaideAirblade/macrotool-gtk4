@@ -1,0 +1,923 @@
+//! Linux/Wayland platform layer — evdev input, uinput injection, grim capture.
+//!
+//! Requires:
+//!   - membership in the `input` group (or root) to read /dev/input/event*
+//!   - membership in the `uinput` group (or root) to write to /dev/uinput
+//!   - `grim` installed for screen capture (wlroots-based compositors)
+//!
+//! The implementation intentionally does not depend on a specific Wayland
+//! compositor protocol for focus detection; it uses /proc-based process
+//! matching and lets the user enable `allowBackground` if focus detection is
+//! not perfect.
+
+#![allow(dead_code)]
+
+use super::{HookCallback, HookHandle, WindowHandle, MOUSE_KEY_NAMES};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::fs::read_dir;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// ── Key name mapping (engine names → Linux evdev key codes) ──────────────
+
+static KEY_MAP: Lazy<HashMap<&'static str, u16>> = Lazy::new(|| {
+    [
+        ("1", 2u16),
+        ("2", 3),
+        ("3", 4),
+        ("4", 5),
+        ("5", 6),
+        ("6", 7),
+        ("7", 8),
+        ("8", 9),
+        ("9", 10),
+        ("0", 11),
+        ("a", 30),
+        ("b", 48),
+        ("c", 46),
+        ("d", 32),
+        ("e", 18),
+        ("f", 33),
+        ("g", 34),
+        ("h", 35),
+        ("i", 23),
+        ("j", 36),
+        ("k", 37),
+        ("l", 38),
+        ("m", 50),
+        ("n", 49),
+        ("o", 24),
+        ("p", 25),
+        ("q", 16),
+        ("r", 19),
+        ("s", 31),
+        ("t", 20),
+        ("u", 22),
+        ("v", 47),
+        ("w", 17),
+        ("x", 45),
+        ("y", 21),
+        ("z", 44),
+        ("minus", 12),       // -
+        ("equal", 13),       // =
+        ("lbracket", 26),    // [
+        ("rbracket", 27),    // ]
+        ("backslash", 43),   // \
+        ("semicolon", 39),   // ;
+        ("apostrophe", 40),  // '
+        ("grave", 41),       // `
+        ("comma", 51),       // ,
+        ("period", 52),      // .
+        ("slash", 53),       // /
+        ("f1", 59),
+        ("f2", 60),
+        ("f3", 61),
+        ("f4", 62),
+        ("f5", 63),
+        ("f6", 64),
+        ("f7", 65),
+        ("f8", 66),
+        ("f9", 67),
+        ("f10", 68),
+        ("f11", 87),
+        ("f12", 88),
+        ("tab", 15),
+        ("enter", 28),
+        ("escape", 1),
+        ("backspace", 14),
+        ("space", 57),
+        ("delete", 111),
+        ("insert", 110),
+        ("home", 102),
+        ("end", 107),
+        ("pgup", 104),
+        ("pgdn", 109),
+        ("up", 103),
+        ("down", 108),
+        ("left", 105),
+        ("right", 106),
+        ("capslock", 58),
+        ("scrolllock", 70),
+        ("numlock", 69),
+        ("printscreen", 99),
+        ("pause", 119),
+        ("shift", 42),       // left shift
+        ("ctrl", 29),        // left ctrl
+        ("alt", 56),         // left alt
+        ("win", 125),        // left meta
+        ("lbutton", 272),    // BTN_LEFT
+        ("rbutton", 273),    // BTN_RIGHT
+        ("mbutton", 274),    // BTN_MIDDLE
+        ("xbutton1", 275),   // BTN_SIDE
+        ("xbutton2", 276),   // BTN_EXTRA
+        ("numpad0", 82),
+        ("numpad1", 79),
+        ("numpad2", 80),
+        ("numpad3", 81),
+        ("numpad4", 75),
+        ("numpad5", 76),
+        ("numpad6", 77),
+        ("numpad7", 71),
+        ("numpad8", 72),
+        ("numpad9", 73),
+        ("numpadenter", 96),
+        ("numpadadd", 78),
+        ("numpadsub", 74),
+        ("numpadmult", 55),
+        ("numpaddiv", 98),
+        ("numpaddot", 83),   // numpad .
+    ]
+    .into_iter()
+    .collect()
+});
+
+static CODE_TO_NAME: Lazy<HashMap<u16, String>> =
+    Lazy::new(|| KEY_MAP.iter().map(|(&k, &v)| (v, k.to_string())).collect());
+
+static MOUSE_KEYS: Lazy<HashMap<&'static str, bool>> = Lazy::new(|| {
+    MOUSE_KEY_NAMES
+        .into_iter()
+        .map(|k| (k, true))
+        .collect()
+});
+
+pub fn name_to_vk(name: &str) -> u16 {
+    KEY_MAP
+        .get(&name.to_lowercase().as_str())
+        .copied()
+        .unwrap_or(0)
+}
+
+pub fn vk_to_name(vk: u16) -> String {
+    CODE_TO_NAME.get(&vk).cloned().unwrap_or_default()
+}
+
+pub fn is_mouse_key(name: &str) -> bool {
+    MOUSE_KEYS.contains_key(&name.to_lowercase().as_str())
+}
+
+pub fn get_all_key_names() -> Vec<String> {
+    let mut names: Vec<String> = KEY_MAP.keys().map(|s| s.to_string()).collect();
+    names.sort();
+    names
+}
+
+// ── Virtual input device (uinput) ────────────────────────────────────────
+
+fn open_uinput_device() -> Option<evdev::uinput::VirtualDevice> {
+    use evdev::{AttributeSet, KeyCode, RelativeAxisCode};
+
+    // Register EVERY possible key code (1..=255) with uinput, not just the
+    // ones in KEY_MAP. When we grab a keyboard and re-emit keys via uinput,
+    // any key the kernel sends (backslash, media keys, etc.) must be accepted
+    // by the virtual device or it silently drops them — making keys like
+    // backslash appear "blocked" to the user.
+    let mut keys = AttributeSet::new();
+    for code in 1u16..=255 {
+        keys.insert(KeyCode::new(code));
+    }
+    // Mouse buttons (BTN_* codes live in the 0x110-0x11f range).
+    keys.insert(KeyCode::BTN_LEFT);
+    keys.insert(KeyCode::BTN_RIGHT);
+    keys.insert(KeyCode::BTN_MIDDLE);
+    keys.insert(KeyCode::BTN_SIDE);
+    keys.insert(KeyCode::BTN_EXTRA);
+
+    let mut rel = AttributeSet::new();
+    rel.insert(RelativeAxisCode::REL_X);
+    rel.insert(RelativeAxisCode::REL_Y);
+    rel.insert(RelativeAxisCode::REL_WHEEL);
+    rel.insert(RelativeAxisCode::REL_HWHEEL);
+
+    let builder = evdev::uinput::VirtualDevice::builder().ok()?;
+    let builder = builder.name("Macrotool Virtual Input");
+    let builder = builder.with_keys(&keys).ok()?;
+    let builder = builder.with_relative_axes(&rel).ok()?;
+    builder.build().ok()
+}
+
+fn emit_key(dev: &mut evdev::uinput::VirtualDevice, code: u16, value: i32) {
+    let ev = evdev::InputEvent::new(evdev::EventType::KEY.0, code, value);
+    let syn = evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
+    if let Err(e) = dev.emit(&[ev, syn]) {
+        log::warn!("[linux] uinput emit key {} val={} failed: {}", code, value, e);
+    }
+}
+
+fn emit_rel(dev: &mut evdev::uinput::VirtualDevice, axis: u16, value: i32) {
+    let ev = evdev::InputEvent::new(evdev::EventType::RELATIVE.0, axis, value);
+    let syn = evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0);
+    let _ = dev.emit(&[ev, syn]);
+}
+
+fn send_linux_key(code: u16, up: bool) {
+    let mut guard = UINPUT.lock();
+    if let Some(ref mut d) = *guard {
+        let value = if up { 0 } else { 1 };
+        emit_key(d, code, value);
+    }
+}
+
+fn send_linux_mouse_button(code: u16, up: bool) {
+    send_linux_key(code, up); // buttons are key events
+}
+
+fn send_linux_mouse_move(dx: i32, dy: i32) {
+    let mut guard = UINPUT.lock();
+    if let Some(ref mut d) = *guard {
+        if dx != 0 {
+            emit_rel(d, evdev::RelativeAxisCode::REL_X.0, dx);
+        }
+        if dy != 0 {
+            emit_rel(d, evdev::RelativeAxisCode::REL_Y.0, dy);
+        }
+    }
+}
+
+// ── Global state ─────────────────────────────────────────────────────────
+
+static UINPUT: Lazy<Mutex<Option<evdev::uinput::VirtualDevice>>> =
+    Lazy::new(|| Mutex::new(open_uinput_device()));
+
+static KB_HOOK_CB: Lazy<Mutex<Option<HookCallback>>> = Lazy::new(|| Mutex::new(None));
+static MS_HOOK_CB: Lazy<Mutex<Option<HookCallback>>> = Lazy::new(|| Mutex::new(None));
+
+static HOOK_STOP: AtomicBool = AtomicBool::new(false);
+static HOOK_THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+static CURSOR_X: AtomicI32 = AtomicI32::new(0);
+static CURSOR_Y: AtomicI32 = AtomicI32::new(0);
+
+static SCREEN_W: AtomicI32 = AtomicI32::new(1920);
+static SCREEN_H: AtomicI32 = AtomicI32::new(1080);
+
+static KEY_STATE: Lazy<Mutex<HashMap<u16, bool>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static LOCK_STATE: Lazy<Mutex<HashMap<u16, bool>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn is_keyboard_device(dev: &evdev::Device) -> bool {
+    let ev = dev.supported_events();
+    if !ev.contains(evdev::EventType::KEY) {
+        return false;
+    }
+    // Exclude pure mice/joysticks by requiring at least one letter key.
+    let keys = dev.supported_keys();
+    keys.map(|k| k.contains(evdev::KeyCode::KEY_A)).unwrap_or(false)
+}
+
+fn is_mouse_device(dev: &evdev::Device) -> bool {
+    let ev = dev.supported_events();
+    ev.contains(evdev::EventType::RELATIVE) || ev.contains(evdev::EventType::ABSOLUTE)
+}
+
+fn open_input_devices() -> Vec<(evdev::Device, PathBuf)> {
+    let mut out = Vec::new();
+    let dir = Path::new("/dev/input");
+    if let Ok(entries) = read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if s.starts_with("event") {
+                if let Ok(dev) = evdev::Device::open(entry.path()) {
+                    // Skip our own uinput virtual device — reading it back would
+                    // create a feedback loop (we inject → we read → we re-inject).
+                    let dev_name = dev.name().unwrap_or_default().to_string();
+                    if dev_name.contains("Macrotool") || dev_name.contains("Virtual Input") {
+                        log::debug!("[linux] skipping own virtual device: {} ({})", s, dev_name);
+                        continue;
+                    }
+                    out.push((dev, entry.path()));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn device_reader_loop(mut dev: evdev::Device, _path: PathBuf, is_primary: bool) {
+    // is_primary=true: this is the primary keyboard. Grab it, call the hotkey
+    //   callback, suppress trigger keys when the game is focused, re-emit
+    //   everything else via uinput.
+    // is_primary=false: this is a shadow keyboard OR a mouse device.
+    //   - Shadow keyboards: grab + re-emit every key (no callback, no
+    //     suppression) — prevents the key leaking to the compositor through
+    //     an ungrabbed device node while avoiding double-firing macros.
+    //   - Mice: read without grabbing (state tracking only).
+    let is_keyboard = is_keyboard_device(&dev);
+    let grab = is_keyboard; // grab all keyboards, never mice
+    let grabbed = if grab {
+        let r = dev.grab();
+        if r.is_err() {
+            log::warn!("[linux] failed to grab device — events may leak");
+        }
+        r.is_ok()
+    } else {
+        false
+    };
+    loop {
+        if HOOK_STOP.load(Ordering::Acquire) {
+            break;
+        }
+        match dev.fetch_events() {
+            Ok(it) => {
+                for ev in it {
+                    handle_linux_event(ev, is_primary, grabbed);
+                }
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+    if grabbed {
+        let _ = dev.ungrab();
+    }
+}
+
+fn handle_linux_event(ev: evdev::InputEvent, is_primary: bool, grabbed: bool) {
+    match ev.destructure() {
+        evdev::EventSummary::Key(_, key, value) => {
+            let code = key.code() as u16;
+            let down = value != 0;
+            KEY_STATE.lock().insert(code, down);
+            let is_lock = matches!(code, 58 | 69 | 70); // caps, num, scroll
+            if is_lock && down {
+                let mut ls = LOCK_STATE.lock();
+                let cur = ls.get(&code).copied().unwrap_or(false);
+                ls.insert(code, !cur);
+            }
+
+            // Not grabbed (mouse) — call the mouse callback for hotkey
+            // detection, but we can't suppress (the compositor already has it).
+            // Track state and return.
+            if !grabbed {
+                let key_name = vk_to_name(code);
+                if !key_name.is_empty() && is_mouse_key(&key_name) {
+                    if let Some(cb) = MS_HOOK_CB.lock().clone() {
+                        let _ = cb(&key_name, down);
+                    }
+                }
+                return;
+            }
+
+            let key_name = vk_to_name(code);
+
+            // Shadow keyboard (grabbed but not primary): re-emit every key
+            // without calling the callback. This prevents the key from leaking
+            // to the compositor through an ungrabbed device node, without
+            // double-firing the hotkey callback.
+            if !is_primary {
+                send_linux_key(code, !down);
+                return;
+            }
+
+            // Primary keyboard: call the hotkey callback, suppress if needed.
+            if key_name.is_empty() {
+                send_linux_key(code, !down);
+                return;
+            }
+
+            let is_mouse = is_mouse_key(&key_name);
+            let cb = if is_mouse {
+                None
+            } else {
+                KB_HOOK_CB.lock().clone()
+            };
+
+            let suppress = match cb {
+                Some(cb) => cb(&key_name, down),
+                None => false,
+            };
+
+            if suppress {
+                log::debug!("[linux] SUPPRESSED key={} code={} down={}", key_name, code, down);
+            }
+
+            if !suppress {
+                send_linux_key(code, !down);
+            }
+        }
+        evdev::EventSummary::RelativeAxis(_, axis, value) => {
+            if axis == evdev::RelativeAxisCode::REL_X || axis == evdev::RelativeAxisCode::REL_Y {
+                let dx = if axis == evdev::RelativeAxisCode::REL_X {
+                    value
+                } else {
+                    0
+                };
+                let dy = if axis == evdev::RelativeAxisCode::REL_Y {
+                    value
+                } else {
+                    0
+                };
+                if dx != 0 || dy != 0 {
+                    let mut x = CURSOR_X.load(Ordering::Relaxed) + dx;
+                    let mut y = CURSOR_Y.load(Ordering::Relaxed) + dy;
+                    let sw = SCREEN_W.load(Ordering::Relaxed);
+                    let sh = SCREEN_H.load(Ordering::Relaxed);
+                    x = x.clamp(0, sw.max(1) - 1);
+                    y = y.clamp(0, sh.max(1) - 1);
+                    CURSOR_X.store(x, Ordering::Relaxed);
+                    CURSOR_Y.store(y, Ordering::Relaxed);
+                }
+            }
+            // Never re-emit mouse movement.
+        }
+        evdev::EventSummary::AbsoluteAxis(_, _, _value) => {
+            // Touchpad — track only, never re-emit.
+        }
+        _ => {}
+    }
+}
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+pub fn set_console_visibility(_visible: bool) {
+    // Linux: no-op; this app is a Tauri GUI process.
+}
+
+pub fn current_process_id() -> u32 {
+    std::process::id()
+}
+
+pub fn get_foreground_window() -> WindowHandle {
+    // Query X11 for the real foreground window. This works under XWayland
+    // (GDK_BACKEND=x11) which is how the app runs on Wayland. The compositor's
+    // shell reads the same _NET_ACTIVE_WINDOW property, so this is the same
+    // info the DM shell has.
+    if let Some(pid) = x11_foreground_pid() {
+        FOCUSED_PID.store(pid, Ordering::Release);
+        return WindowHandle(pid as u64);
+    }
+    // Fallback: last known focused PID (may be 0 on first run).
+    WindowHandle(FOCUSED_PID.load(Ordering::Acquire) as u64)
+}
+
+/// Query X11 _NET_ACTIVE_WINDOW → _NET_WM_PID to find the PID of the
+/// currently focused window. Returns None if X11 is unavailable or the
+/// focused window has no PID (rare — means a WM-internal window).
+fn x11_foreground_pid() -> Option<u32> {
+    use x11::xlib;
+    use std::ffi::CString;
+    use std::os::raw::{c_int, c_ulong, c_uchar};
+
+    unsafe {
+        let display = xlib::XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            log::debug!("[linux] XOpenDisplay failed — no X11");
+            return None;
+        }
+        let _guard = DisplayGuard(display);
+
+        let root = xlib::XDefaultRootWindow(display);
+        let atom_active = CString::new("_NET_ACTIVE_WINDOW").ok()?;
+        let atom_active = xlib::XInternAtom(display, atom_active.as_ptr(), 0);
+        let atom_pid = CString::new("_NET_WM_PID").ok()?;
+        let atom_pid = xlib::XInternAtom(display, atom_pid.as_ptr(), 0);
+
+        // Try _NET_ACTIVE_WINDOW first (EWMH-compliant WMs).
+        let mut active_win: c_ulong = 0;
+        let mut got_active = false;
+
+        if atom_active != 0 {
+            let mut actual_type: c_ulong = 0;
+            let mut actual_format: c_int = 0;
+            let mut nitems: c_ulong = 0;
+            let mut bytes_after: c_ulong = 0;
+            let mut data: *mut c_uchar = std::ptr::null_mut();
+            let r = xlib::XGetWindowProperty(
+                display, root, atom_active, 0, 1, 0, xlib::AnyPropertyType as c_ulong,
+                &mut actual_type, &mut actual_format, &mut nitems, &mut bytes_after, &mut data,
+            );
+            if r == 0 && !data.is_null() && nitems >= 1 {
+                active_win = *(data as *const c_ulong);
+                xlib::XFree(data as *mut std::ffi::c_void);
+                got_active = active_win != 0;
+            } else if !data.is_null() {
+                xlib::XFree(data as *mut std::ffi::c_void);
+            }
+        }
+
+        // Fallback: XGetInputFocus — universally supported, returns the window
+        // that currently has keyboard focus. Works even when the WM doesn't
+        // implement EWMH (_NET_ACTIVE_WINDOW).
+        if !got_active {
+            let mut focus_win: c_ulong = 0;
+            let mut revert: c_int = 0;
+            if xlib::XGetInputFocus(display, &mut focus_win, &mut revert) != 0 && focus_win != 0 {
+                active_win = focus_win;
+                got_active = true;
+            }
+        }
+
+        if !got_active {
+            log::debug!("[linux] no active window from X11");
+            return None;
+        }
+
+        // Read _NET_WM_PID from the active window.
+        if atom_pid != 0 {
+            let mut actual_type: c_ulong = 0;
+            let mut actual_format: c_int = 0;
+            let mut nitems: c_ulong = 0;
+            let mut bytes_after: c_ulong = 0;
+            let mut data2: *mut c_uchar = std::ptr::null_mut();
+            let r2 = xlib::XGetWindowProperty(
+                display, active_win, atom_pid, 0, 1, 0, xlib::AnyPropertyType as c_ulong,
+                &mut actual_type, &mut actual_format, &mut nitems, &mut bytes_after, &mut data2,
+            );
+            if r2 == 0 && !data2.is_null() && nitems >= 1 {
+                let pid = *(data2 as *const c_ulong) as u32;
+                xlib::XFree(data2 as *mut std::ffi::c_void);
+                if pid != 0 {
+                    log::debug!("[linux] X11 active win=0x{:x} pid={}", active_win, pid);
+                    return Some(pid);
+                }
+            }
+            if !data2.is_null() {
+                xlib::XFree(data2 as *mut std::ffi::c_void);
+            }
+        }
+
+        // Last resort: if _NET_WM_PID isn't set, we can't get the PID.
+        log::debug!("[linux] X11 active win=0x{:x} but no _NET_WM_PID", active_win);
+        None
+    }
+}
+
+/// RAII guard to ensure XCloseDisplay is called.
+struct DisplayGuard(*mut x11::xlib::Display);
+impl Drop for DisplayGuard {
+    fn drop(&mut self) {
+        unsafe { x11::xlib::XCloseDisplay(self.0); }
+    }
+}
+
+pub fn get_window_thread_process_id(hwnd: WindowHandle) -> (u32, u32) {
+    (0, hwnd.0 as u32)
+}
+
+pub fn is_window_valid(_hwnd: WindowHandle) -> bool {
+    true
+}
+
+pub fn is_window_visible(_hwnd: WindowHandle) -> bool {
+    true
+}
+
+pub fn get_window_rect(_hwnd: WindowHandle) -> Option<RECT> {
+    let w = SCREEN_W.load(Ordering::Acquire);
+    let h = SCREEN_H.load(Ordering::Acquire);
+    Some(RECT {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    })
+}
+
+pub fn get_screen_resolution() -> (i32, i32) {
+    // Try to update from a quick grim capture.
+    if let Some((w, h, _)) = capture_screen_bgra() {
+        SCREEN_W.store(w, Ordering::Release);
+        SCREEN_H.store(h, Ordering::Release);
+    }
+    (SCREEN_W.load(Ordering::Acquire), SCREEN_H.load(Ordering::Acquire))
+}
+
+pub fn enum_windows_for_pid<F>(pid: u32, f: &mut F)
+where
+    F: FnMut(WindowHandle),
+{
+    f(WindowHandle(pid as u64));
+}
+
+pub fn query_process_path(pid: u32) -> Option<String> {
+    // For native Linux apps, /proc/{pid}/exe is the real binary.
+    // For Wine/Proton games, /proc/{pid}/exe points to the wine64 binary
+    // (a Linux executable), NOT the Windows .exe. In that case the cmdline
+    // contains the Windows path (e.g. "Z:\Games\SEBNS\bin64\Client.exe").
+    // Strategy: read exe first. If it's NOT a .exe (i.e. it's a Linux binary
+    // like wine64/preloader), fall back to cmdline which has the Windows exe.
+    let exe_path = PathBuf::from(format!("/proc/{}/exe", pid));
+    if let Ok(p) = std::fs::read_link(&exe_path) {
+        let path_str = p.to_string_lossy().to_string();
+        let lower = path_str.to_lowercase();
+        if lower.ends_with(".exe") {
+            // Native Windows exe (unlikely on Linux, but handle it).
+            return Some(path_str);
+        }
+        // It's a Linux binary (wine64, wineserver, proton, etc.).
+        // Don't return it — fall through to cmdline.
+    }
+
+    // Read /proc/{pid}/cmdline — null-separated args.
+    let cmd = PathBuf::from(format!("/proc/{}/cmdline", pid));
+    if let Ok(data) = std::fs::read(&cmd) {
+        // cmdline is null-separated. The first arg is usually the executable
+        // path. For Wine it's often "Z:\path\to\Client.exe".
+        let args: Vec<&[u8]> = data.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+        if let Some(first) = args.first() {
+            let s = String::from_utf8_lossy(first).to_string();
+            return Some(s);
+        }
+        // Some Wine versions put the path in a later arg; scan all args.
+        for arg in &args {
+            let s = String::from_utf8_lossy(arg);
+            if s.to_lowercase().ends_with(".exe") {
+                return Some(s.to_string());
+            }
+        }
+    }
+
+    // Absolute last resort: return the exe path even if it's not .exe.
+    if let Ok(p) = std::fs::read_link(&exe_path) {
+        return Some(p.to_string_lossy().to_string());
+    }
+    None
+}
+
+pub fn is_process_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+// ── Input injection ──────────────────────────────────────────────────────
+
+pub fn send_key(key: &str) {
+    if is_mouse_key(key) {
+        send_mouse(key, false);
+        std::thread::yield_now();
+        send_mouse(key, true);
+        return;
+    }
+    let code = name_to_vk(key);
+    if code == 0 {
+        log::warn!("[linux] send_key unknown {}", key);
+        return;
+    }
+    send_linux_key(code, false);
+    std::thread::yield_now();
+    send_linux_key(code, true);
+}
+
+pub fn send_key_to_window(_hwnd: WindowHandle, key: &str) {
+    // Wayland has no direct per-window injection; inject globally.
+    send_key(key);
+}
+
+fn send_mouse(key: &str, up: bool) {
+    let code = name_to_vk(key);
+    if code == 0 {
+        return;
+    }
+    send_linux_mouse_button(code, up);
+}
+
+pub fn get_async_key_state(vk: i32) -> bool {
+    KEY_STATE.lock().get(&(vk as u16)).copied().unwrap_or(false)
+}
+
+pub fn get_key_state_toggled(vk: i32) -> u16 {
+    let down = LOCK_STATE.lock().get(&(vk as u16)).copied().unwrap_or(false);
+    if down { 1 } else { 0 }
+}
+
+// ── Pixel reading / screen capture ───────────────────────────────────────
+
+pub fn get_cursor_pos() -> (i32, i32) {
+    (CURSOR_X.load(Ordering::Acquire), CURSOR_Y.load(Ordering::Acquire))
+}
+
+pub fn get_pixel_color(x: i32, y: i32) -> u32 {
+    let region = get_pixels_region(x, y, 1, 1);
+    region.first().copied().unwrap_or(0)
+}
+
+pub fn get_pixels_region(x: i32, y: i32, w: i32, h: i32) -> Vec<u32> {
+    let count = (w.max(0) * h.max(0)) as usize;
+    let mut out = vec![0u32; count];
+    if w <= 0 || h <= 0 {
+        return out;
+    }
+    let geom = format!("{},{} {}x{}", x, y, w, h);
+    match grim_capture(Some(&geom)) {
+        Some((cw, ch, rgb)) if cw == w && ch == h => {
+            for (i, px) in out.iter_mut().enumerate() {
+                *px = rgb[i];
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+pub fn capture_screen_bgra() -> Option<(i32, i32, Vec<u8>)> {
+    let (w, h, rgb) = grim_capture(None)?;
+    let mut bgra = vec![0u8; (w * h * 4) as usize];
+    for i in 0..(w * h) as usize {
+        bgra[i * 4] = (rgb[i] & 0xFF) as u8;
+        bgra[i * 4 + 1] = ((rgb[i] >> 8) & 0xFF) as u8;
+        bgra[i * 4 + 2] = ((rgb[i] >> 16) & 0xFF) as u8;
+        bgra[i * 4 + 3] = 0xFF;
+    }
+    Some((w, h, bgra))
+}
+
+pub fn check_pixels_batched(
+    pixels: &[(i32, i32, u32, i32)],
+    match_mode: &str,
+) -> bool {
+    if pixels.is_empty() {
+        return false;
+    }
+    let min_x = pixels.iter().map(|p| p.0).min().unwrap_or(0);
+    let min_y = pixels.iter().map(|p| p.1).min().unwrap_or(0);
+    let max_x = pixels.iter().map(|p| p.0).max().unwrap_or(0);
+    let max_y = pixels.iter().map(|p| p.1).max().unwrap_or(0);
+    let w = max_x - min_x + 1;
+    let h = max_y - min_y + 1;
+    let region = get_pixels_region(min_x, min_y, w, h);
+    let mut matched = 0;
+    for &(x, y, target, variation) in pixels {
+        let dx = x - min_x;
+        let dy = y - min_y;
+        let idx = (dy * w + dx) as usize;
+        if idx >= region.len() {
+            continue;
+        }
+        let color = region[idx];
+        let r = (color >> 16) & 0xFF;
+        let g = (color >> 8) & 0xFF;
+        let b = color & 0xFF;
+        let tr = (target >> 16) & 0xFF;
+        let tg = (target >> 8) & 0xFF;
+        let tb = target & 0xFF;
+        let ok = (r as i32 - tr as i32).unsigned_abs() <= variation as u32
+            && (g as i32 - tg as i32).unsigned_abs() <= variation as u32
+            && (b as i32 - tb as i32).unsigned_abs() <= variation as u32;
+        if ok {
+            matched += 1;
+            if match_mode == "any" {
+                return true;
+            }
+        }
+    }
+    if match_mode == "all" {
+        matched == pixels.len()
+    } else {
+        matched > 0
+    }
+}
+
+fn grim_capture(geometry: Option<&str>) -> Option<(i32, i32, Vec<u32>)> {
+    let mut cmd = Command::new("grim");
+    cmd.arg("-t").arg("png").arg("-");
+    if let Some(g) = geometry {
+        cmd.arg("-g").arg(g);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        log::warn!(
+            "[linux] grim failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    decode_png(&output.stdout)
+}
+
+fn decode_png(data: &[u8]) -> Option<(i32, i32, Vec<u32>)> {
+    use image::ImageReader;
+    let cursor = std::io::Cursor::new(data);
+    let img = ImageReader::new(cursor)
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as i32, rgba.height() as i32);
+    let rgb: Vec<u32> = rgba
+        .pixels()
+        .map(|p| {
+            let [r, g, b, _] = p.0;
+            ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        })
+        .collect();
+    Some((w, h, rgb))
+}
+
+// ── Timing ───────────────────────────────────────────────────────────────
+
+pub fn precise_sleep(ms: f64) {
+    let start = Instant::now();
+    let target = Duration::from_secs_f64(ms / 1000.0);
+    while start.elapsed() < target {
+        std::hint::spin_loop();
+    }
+}
+
+pub fn set_thread_priority_above_normal() {
+    // best-effort nice decrease
+    let _ = unsafe { libc::nice(-1) };
+}
+
+pub fn set_macro_thread_affinity() {
+    // no-op on Linux
+}
+
+// ── Global hooks ─────────────────────────────────────────────────────────
+
+static FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_keyboard_hook(callback: HookCallback) -> Result<HookHandle, String> {
+    *KB_HOOK_CB.lock() = Some(callback);
+    Ok(HookHandle(1))
+}
+
+pub fn set_mouse_hook(callback: HookCallback) -> Result<HookHandle, String> {
+    *MS_HOOK_CB.lock() = Some(callback);
+    Ok(HookHandle(2))
+}
+
+pub fn unhook(_hook: HookHandle) {
+    HOOK_STOP.store(true, Ordering::Release);
+}
+
+pub fn run_hook_message_loop(_stop_rx: crossbeam_channel::Receiver<()>) -> Result<(), String> {
+    HOOK_STOP.store(false, Ordering::Release);
+
+    // Ensure the uinput device exists.
+    if UINPUT.lock().is_none() {
+        *UINPUT.lock() = open_uinput_device();
+    }
+
+    // Make sure virtual device is fully registered before we start grabbing.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let devices = open_input_devices();
+
+    // A single physical keyboard often exposes MULTIPLE evdev device nodes
+    // (e.g. "SCYROX Xpunk 63 Keyboard" on event9/10/11/13 + the 8K dongle on
+    // event14-22). If we grab only ONE, the keypress leaks to the compositor
+    // through the ungrabbed devices. If we grab ALL and let each call the
+    // hotkey callback, the first fires the transition (suppress=true) but the
+    // second sees Transition::None (suppress=false) and re-emits — breaking
+    // suppression and causing hold macros to stop instantly.
+    //
+    // Fix: grab ALL keyboard devices. The FIRST keyboard we find is the
+    // "primary" — it owns the hotkey callback. All other keyboards are
+    // "shadow" devices: they grab + re-emit every key (no callback, always
+    // pass through), preventing key leakage without double-firing macros.
+    // Mouse devices are never grabbed.
+    let mut primary_keyboard_seen = false;
+
+    let mut handles = Vec::new();
+    for (dev, path) in devices {
+        let is_kb = is_keyboard_device(&dev);
+        let is_mouse = is_mouse_device(&dev);
+        if is_kb || is_mouse {
+            let is_primary = is_kb && !primary_keyboard_seen;
+            if is_primary {
+                primary_keyboard_seen = true;
+            }
+            let _name = path.file_name().unwrap_or_default().to_string_lossy();
+            let handle = thread::Builder::new()
+                .name(format!("evdev-{}", _name))
+                .spawn(move || device_reader_loop(dev, path, is_primary))
+                .map_err(|e| format!("spawn evdev reader: {}", e))?;
+            handles.push(handle);
+        }
+    }
+    if !primary_keyboard_seen {
+        log::warn!("[linux] no keyboard device grabbed — suppression will not work");
+    }
+    *HOOK_THREADS.lock() = handles;
+
+    // Wait until stopped, then join all device threads.
+    let _ = _stop_rx.recv();
+    HOOK_STOP.store(true, Ordering::Release);
+    let handles: Vec<_> = HOOK_THREADS.lock().drain(..).collect();
+    for h in handles {
+        let _ = h.join();
+    }
+
+    Ok(())
+}
+
+// ── Window rectangle type (matches the original Win32 RECT layout) ─────────────────
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RECT {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
