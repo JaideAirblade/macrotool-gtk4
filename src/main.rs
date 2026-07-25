@@ -12,6 +12,50 @@ use std::sync::Arc;
 
 const APP_ID: &str = "com.jaide.macrotool";
 
+/// Theme-aware UI styling. GTK4 app CSS cannot reference @theme_* variables
+/// (GTK3/libadwaita-only — the parser warns and drops them), so everything
+/// derives from `currentColor`, which the theme sets on each widget. This
+/// makes the app follow the desktop theme (light or dark, any accent).
+const UI_CSS: &str = "
+.card {
+    background: alpha(currentColor, 0.05);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.tab-title {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.heading {
+    font-weight: bold;
+}
+
+.dim-label {
+    color: alpha(currentColor, 0.55);
+}
+
+.accent {
+    font-weight: bold;
+}
+
+/* suggested-action / destructive-action are libadwaita classes; approximate
+ * them with a subtle tinted background so they read as primary/danger
+ * without hardcoded colors. */
+button.suggested-action {
+    background: alpha(currentColor, 0.18);
+}
+
+button.destructive-action {
+    color: #e06c75;
+}
+
+button.capturing {
+    background: alpha(currentColor, 0.2);
+}
+";
+
 fn main() {
     // Install signal handlers so the overlay is destroyed on SIGTERM/SIGINT.
     // Without this, killing the process leaves the layer-shell surface visible.
@@ -47,6 +91,19 @@ extern "C" fn sig_handler(_sig: libc::c_int) {
 }
 
 fn build_ui(app: &Application) {
+    // Load theme-aware UI CSS now that GTK is initialized
+    {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(UI_CSS);
+        if let Some(display) = gtk4::gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    }
+
     let cfg = Arc::new(config::Manager::new());
     if let Err(e) = cfg.load() {
         log::warn!("[config] load failed: {}", e);

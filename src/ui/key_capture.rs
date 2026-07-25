@@ -52,8 +52,11 @@ impl KeyCapture {
         });
         container.add_controller(key_ctrl);
 
-        // Mouse controller
+        // Mouse controller — set_button(0) so ALL mouse buttons are heard
+        // (default is primary-button-only, which silently ignored right /
+        // middle / X buttons, making mouse hotkeys impossible to capture).
         let mouse_ctrl = GestureClick::new();
+        mouse_ctrl.set_button(0);
         let cap_m = capturing.clone();
         let on_change_m = on_change.clone();
         let entry_m = entry.clone();
