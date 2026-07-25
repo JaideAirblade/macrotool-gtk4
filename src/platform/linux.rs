@@ -468,6 +468,10 @@ fn x11_foreground_pid() -> Option<u32> {
     use std::ffi::CString;
     use std::os::raw::{c_int, c_ulong, c_uchar};
 
+    // Install our silent error handler so BadWindow errors from stale window
+    // IDs don't kill the process.
+    install_x11_error_handler();
+
     unsafe {
         let display = xlib::XOpenDisplay(std::ptr::null());
         if display.is_null() {
@@ -523,7 +527,9 @@ fn x11_foreground_pid() -> Option<u32> {
         }
 
         // Read _NET_WM_PID from the active window.
-        if atom_pid != 0 {
+        // Validate the window ID first — XWayland can return bogus IDs (e.g. 0x1)
+        // that cause BadWindow errors when queried.
+        if atom_pid != 0 && got_active && active_win != 0 {
             let mut actual_type: c_ulong = 0;
             let mut actual_format: c_int = 0;
             let mut nitems: c_ulong = 0;
@@ -533,6 +539,10 @@ fn x11_foreground_pid() -> Option<u32> {
                 display, active_win, atom_pid, 0, 1, 0, xlib::AnyPropertyType as c_ulong,
                 &mut actual_type, &mut actual_format, &mut nitems, &mut bytes_after, &mut data2,
             );
+            // Flush the X11 error queue — with our silent handler, errors
+            // are swallowed but we still need to sync so the return value
+            // reflects reality.
+            xlib::XSync(display, 0);
             if r2 == 0 && !data2.is_null() && nitems >= 1 {
                 let pid = *(data2 as *const c_ulong) as u32;
                 xlib::XFree(data2 as *mut std::ffi::c_void);
@@ -557,6 +567,29 @@ struct DisplayGuard(*mut x11::xlib::Display);
 impl Drop for DisplayGuard {
     fn drop(&mut self) {
         unsafe { x11::xlib::XCloseDisplay(self.0); }
+    }
+}
+
+/// Custom X11 error handler that swallows errors instead of calling the
+/// default handler (which prints to stderr and can abort the process on
+/// BadWindow / BadAtom errors from stale window IDs).
+extern "C" fn x11_silent_error_handler(
+    _display: *mut x11::xlib::Display,
+    _error: *mut x11::xlib::XErrorEvent,
+) -> std::os::raw::c_int {
+    // Return 0 to indicate "handled" — the default handler prints the error
+    // and calls exit(1) on some error types, killing the whole app.
+    0
+}
+
+/// Install the silent X11 error handler once. Must be called before any
+/// XGetWindowProperty / XQueryTree calls.
+static X11_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+fn install_x11_error_handler() {
+    if !X11_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        unsafe {
+            x11::xlib::XSetErrorHandler(Some(x11_silent_error_handler));
+        }
     }
 }
 
