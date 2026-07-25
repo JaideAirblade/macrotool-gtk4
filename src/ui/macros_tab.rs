@@ -183,6 +183,10 @@ fn make_macro_card(
     header.append(&name_entry);
 
     let badge = Label::new(Some(if m.enabled { "ON" } else { "OFF" }));
+    badge.add_css_class("badge");
+    if !m.enabled {
+        badge.add_css_class("badge-off");
+    }
     header.append(&badge);
 
     {
@@ -289,9 +293,17 @@ fn make_macro_card(
     {
         let cfg = cfg.clone();
         let engine = engine.clone();
+        let badge = badge.clone();
         en_sw.connect_state_set(move |_, state| {
             update_macro(&cfg, idx, |m| m.enabled = state);
             engine.reload_profile();
+            // Live-update the badge
+            badge.set_text(if state { "ON" } else { "OFF" });
+            if state {
+                badge.remove_css_class("badge-off");
+            } else {
+                badge.add_css_class("badge-off");
+            }
             glib::Propagation::Proceed
         });
     }

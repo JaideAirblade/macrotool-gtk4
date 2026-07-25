@@ -44,15 +44,27 @@ impl Overlay {
         // opaque black square (the window's own background).
         window.add_css_class("ovl-window");
 
-        // Inject overlay CSS
+        // Inject overlay CSS — start neutral, then swap in theme-derived
+        // colors once the window is realized and we can read the theme.
         let provider = CssProvider::new();
-        provider.load_from_data(OVERLAY_CSS);
+        provider.load_from_data(&overlay_css(&ThemeColors::fallback()));
         if let Some(display) = gtk4::gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
                 &provider,
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
+        }
+
+        // On realize: read the ACTUAL loaded theme's colors via
+        // lookup_color() (works with any theme that @define-colors them —
+        // Adwaita, matugen/DMS, etc.) and rebuild the CSS with those values.
+        {
+            let provider = provider.clone();
+            window.connect_realize(move |win| {
+                let colors = ThemeColors::from_widget(win.upcast_ref());
+                provider.load_from_data(&overlay_css(&colors));
+            });
         }
 
         let content = GtkBox::new(Orientation::Vertical, 0);
@@ -287,121 +299,198 @@ fn render_into(content: &GtkBox, cfg: &Arc<config::Manager>, engine: &Arc<engine
     }
 }
 
-const OVERLAY_CSS: &str = "
-/* Theme-aware overlay. GTK4 app CSS can't reference @theme_* variables
- * (parser drops them with warnings), so all internals derive from
- * currentColor, which we set once on .ovl-root. The root keeps a neutral
- * dark translucent background so it stays readable over any game content. */
+// ── Runtime theme colors ─────────────────────────────────────────────────
+//
+// GTK4 app CSS cannot reference @theme_* variables (the parser drops them),
+// but we CAN read the loaded theme's @define-color values at runtime via
+// StyleContext::lookup_color(). We then generate the overlay CSS with those
+// hex values so it follows the desktop theme (Adwaita, matugen/DMS, …).
 
+struct ThemeColors {
+    bg: String,
+    fg: String,
+    accent: String,
+    accent_fg: String,
+    ok: String,
+    err: String,
+    warn: String,
+}
+
+impl ThemeColors {
+    fn fallback() -> Self {
+        ThemeColors {
+            bg: "#101018".into(),
+            fg: "#eeeeee".into(),
+            accent: "#eeeeee".into(),
+            accent_fg: "#101018".into(),
+            ok: "#5be37d".into(),
+            err: "#ff6b6b".into(),
+            warn: "#ffc46b".into(),
+        }
+    }
+
+    /// Read colors from a realized widget's style context. Tries the common
+    /// @define-color names in priority order and falls back to neutral
+    /// values for anything the theme doesn't define.
+    fn from_widget(w: &gtk4::Widget) -> Self {
+        let sc = w.style_context();
+        let pick = |names: &[&str], fallback: &str| -> String {
+            for n in names {
+                if let Some(c) = sc.lookup_color(n) {
+                    return rgba_to_hex(&c);
+                }
+            }
+            fallback.to_string()
+        };
+
+        ThemeColors {
+            bg: pick(&["theme_bg_color", "window_bg_color", "base_color"], "#101018"),
+            fg: pick(&["theme_fg_color", "window_fg_color", "text_color"], "#eeeeee"),
+            accent: pick(
+                &["accent_bg_color", "accent_color", "theme_selected_bg_color"],
+                "#eeeeee",
+            ),
+            accent_fg: pick(
+                &["accent_fg_color", "theme_selected_fg_color"],
+                "#101018",
+            ),
+            ok: pick(&["success_color"], "#5be37d"),
+            err: pick(&["error_color", "destructive_bg_color"], "#ff6b6b"),
+            warn: pick(&["warning_color"], "#ffc46b"),
+        }
+    }
+}
+
+fn rgba_to_hex(c: &gtk4::gdk::RGBA) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (c.red() * 255.0).round() as u8,
+        (c.green() * 255.0).round() as u8,
+        (c.blue() * 255.0).round() as u8
+    )
+}
+
+fn overlay_css(t: &ThemeColors) -> String {
+    format!(
+        "
 /* The window surface itself must be transparent or the rounded .ovl-root
  * corners render on an opaque black square. */
-.ovl-window, .ovl-window.background {
+.ovl-window, .ovl-window.background {{
     background: transparent;
     background-color: transparent;
-}
+}}
 
-.ovl-root {
-    background: alpha(#101018, 0.85);
+.ovl-root {{
+    background: alpha({bg}, 0.85);
     border-radius: 12px;
-    border: 1px solid alpha(#ffffff, 0.12);
+    border: 1px solid alpha({fg}, 0.15);
     padding: 10px 14px;
-    color: #eeeeee;
+    color: {fg};
     box-shadow: 0 4px 20px alpha(#000000, 0.4);
-}
+}}
 
-.ovl-header {
+.ovl-header {{
     margin-bottom: 8px;
-}
+}}
 
-.ovl-dot-on {
-    color: #5be37d;
+.ovl-dot-on {{
+    color: {ok};
     font-size: 14px;
-}
-.ovl-dot-off {
-    color: #ff6b6b;
+}}
+.ovl-dot-off {{
+    color: {err};
     font-size: 14px;
-}
+}}
 
-.ovl-title {
+.ovl-title {{
     font-weight: bold;
     font-size: 13px;
-}
+}}
 
-.ovl-section {
+.ovl-section {{
     margin-top: 6px;
     margin-bottom: 4px;
-}
+}}
 
-.ovl-section-label {
+.ovl-section-label {{
     font-size: 9px;
-    color: alpha(currentColor, 0.45);
+    color: alpha({fg}, 0.45);
     text-transform: uppercase;
     letter-spacing: 1px;
     margin-bottom: 2px;
-}
+}}
 
-.ovl-macro-row {
+.ovl-macro-row {{
     margin-bottom: 1px;
-}
+}}
 
-.ovl-key {
-    background: alpha(currentColor, 0.12);
+.ovl-key {{
+    background: alpha({fg}, 0.12);
     border-radius: 4px;
     padding: 1px 6px;
     font-size: 10px;
     font-weight: bold;
-    color: alpha(currentColor, 0.65);
+    color: alpha({fg}, 0.65);
     min-width: 20px;
-}
-.ovl-key-on {
-    background: currentColor;
+}}
+.ovl-key-on {{
+    background: {accent};
     border-radius: 4px;
     padding: 1px 6px;
     font-size: 10px;
     font-weight: bold;
-    color: #101018;
+    color: {accent_fg};
     min-width: 20px;
-}
+}}
 
-.ovl-macro-name {
+.ovl-macro-name {{
     font-size: 11px;
-}
+}}
 
-.ovl-running {
-    color: #5be37d;
+.ovl-running {{
+    color: {ok};
     font-size: 10px;
-}
+}}
 
-.ovl-buff-row {
+.ovl-buff-row {{
     margin-bottom: 2px;
-}
+}}
 
-.ovl-buff-name {
+.ovl-buff-name {{
     font-size: 10px;
     min-width: 55px;
-}
+}}
 
-.ovl-bar {
+.ovl-bar {{
     min-width: 80px;
-}
-.ovl-bar trough {
-    background: alpha(currentColor, 0.12);
+}}
+.ovl-bar trough {{
+    background: alpha({fg}, 0.12);
     border-radius: 3px;
-}
-.ovl-bar progress {
-    background: currentColor;
+}}
+.ovl-bar progress {{
+    background: {accent};
     border-radius: 3px;
-}
+}}
 
-.ovl-buff-time {
+.ovl-buff-time {{
     font-size: 10px;
-    color: alpha(currentColor, 0.5);
+    color: alpha({fg}, 0.5);
     min-width: 28px;
-}
+}}
 
-.ovl-warn {
-    color: #ffc46b;
+.ovl-warn {{
+    color: {warn};
     font-size: 10px;
     margin-top: 2px;
+}}
+",
+        bg = t.bg,
+        fg = t.fg,
+        accent = t.accent,
+        accent_fg = t.accent_fg,
+        ok = t.ok,
+        err = t.err,
+        warn = t.warn
+    )
 }
-";

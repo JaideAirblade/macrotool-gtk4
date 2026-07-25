@@ -54,6 +54,37 @@ button.destructive-action {
 button.capturing {
     background: alpha(currentColor, 0.2);
 }
+
+/* ON/OFF state badges on macro/trigger/buff cards */
+.badge {
+    font-weight: bold;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: alpha(currentColor, 0.12);
+}
+.badge-off {
+    color: alpha(currentColor, 0.45);
+    background: alpha(currentColor, 0.06);
+}
+
+/* Notebook tab bar — make the selected tab visibly follow the theme.
+ * GtkNotebook tabs get little styling from most themes (they style
+ * libadwaita's AdwTabBar instead), so give them a currentColor-derived
+ * highlight. */
+notebook > header {
+    background: alpha(currentColor, 0.04);
+}
+notebook > header > tabs > tab {
+    padding: 6px 14px;
+}
+notebook > header > tabs > tab:checked {
+    background: alpha(currentColor, 0.12);
+    box-shadow: inset 0 -2px 0 currentColor;
+}
+notebook > header > tabs > tab:hover {
+    background: alpha(currentColor, 0.07);
+}
 ";
 
 fn main() {

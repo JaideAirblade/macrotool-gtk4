@@ -180,6 +180,10 @@ fn make_trigger_card(
     header.append(&name_entry);
 
     let badge = Label::new(Some(if t.enabled { "ON" } else { "OFF" }));
+    badge.add_css_class("badge");
+    if !t.enabled {
+        badge.add_css_class("badge-off");
+    }
     header.append(&badge);
 
     {
@@ -298,9 +302,16 @@ fn make_trigger_card(
     {
         let cfg = cfg.clone();
         let engine = engine.clone();
+        let badge = badge.clone();
         en_sw.connect_state_set(move |_, state| {
             update_trigger(&cfg, idx, |t| t.enabled = state);
             engine.reload_profile();
+            badge.set_text(if state { "ON" } else { "OFF" });
+            if state {
+                badge.remove_css_class("badge-off");
+            } else {
+                badge.add_css_class("badge-off");
+            }
             glib::Propagation::Proceed
         });
     }
