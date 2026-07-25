@@ -116,26 +116,8 @@ impl MainWindow {
 
         // ── Overlay (layer-shell, stays on top) ─────────────────────
         let overlay = Overlay::new(cfg.clone(), engine.clone());
-
-        // Show overlay (default to top-left, can be changed via set_position)
         overlay.set_position("top-left");
         overlay.show();
-
-        // Periodic overlay refresh (every 500ms)
-        let cfg_sync = cfg.clone();
-        let engine_sync = engine.clone();
-        let overlay_ref = overlay.window().clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-            // Only update if the overlay is visible
-            if overlay_ref.is_visible() {
-                // We can't call overlay.refresh() directly because we don't
-                // own the Overlay struct here — but we can update via a
-                // channel or by storing the child boxes. For now, this is
-                // a no-op placeholder; a full implementation would use a
-                // channel to send state updates to the overlay.
-            }
-            glib::ControlFlow::Continue
-        });
 
         Self {
             window,
