@@ -106,6 +106,77 @@ impl KeyCapture {
     }
 }
 
+/// Open a modal "press a key or mouse button" dialog. The first key or mouse
+/// button pressed is passed to `on_capture` (normalized to engine format) and
+/// the dialog closes. Escape cancels without capturing.
+pub fn show_capture_dialog(
+    parent: &impl IsA<gtk4::Widget>,
+    on_capture: impl Fn(&str) + 'static,
+) {
+    let dialog = gtk4::Window::new();
+    dialog.set_title(Some("Capture Key"));
+    dialog.set_modal(true);
+    if let Some(win) = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+        dialog.set_transient_for(Some(&win));
+    }
+    dialog.set_default_size(280, 0);
+
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_start(20);
+    vbox.set_margin_end(20);
+    vbox.set_margin_top(20);
+    vbox.set_margin_bottom(20);
+
+    let label = gtk4::Label::new(Some("Press a key or mouse button…"));
+    vbox.append(&label);
+
+    let hint = gtk4::Label::new(Some("(Escape to cancel)"));
+    hint.add_css_class("dim-label");
+    vbox.append(&hint);
+
+    dialog.set_child(Some(&vbox));
+
+    let on_capture = std::rc::Rc::new(on_capture);
+
+    // Keyboard capture
+    {
+        let key_ctrl = EventControllerKey::new();
+        let dlg = dialog.clone();
+        let on_capture = on_capture.clone();
+        key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
+            let name = normalize_key(keyval);
+            if name == "escape" {
+                dlg.close();
+            } else if !name.is_empty() {
+                on_capture(&name);
+                dlg.close();
+            }
+            glib::Propagation::Stop
+        });
+        dialog.add_controller(key_ctrl);
+    }
+
+    // Mouse button capture (all buttons)
+    {
+        let mouse = GestureClick::new();
+        mouse.set_button(0);
+        let dlg = dialog.clone();
+        let on_capture = on_capture.clone();
+        let mouse_c = mouse.clone();
+        mouse.connect_pressed(move |_, _, _, _| {
+            let btn = mouse_c.current_button();
+            let name = mouse_button_name(btn as i32);
+            if !name.is_empty() {
+                on_capture(&name);
+                dlg.close();
+            }
+        });
+        vbox.add_controller(mouse);
+    }
+
+    dialog.present();
+}
+
 fn normalize_key(keyval: gtk4::gdk::Key) -> String {
     let name = keyval.name().unwrap_or_default().to_lowercase();
     match name.as_str() {

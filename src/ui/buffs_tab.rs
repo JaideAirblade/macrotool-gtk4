@@ -342,10 +342,16 @@ fn make_buff_card(
         let engine = engine.clone();
         let content_box = content_box.clone();
         let add_wk_btn = Button::with_label("+ Key");
-        add_wk_btn.connect_clicked(move |_| {
-            update_buff(&cfg, idx, |b| b.watch_keys.push("a".into()));
-            engine.reload_profile();
-            render(&content_box, &cfg, &engine);
+        add_wk_btn.connect_clicked(move |btn| {
+            let cfg = cfg.clone();
+            let engine = engine.clone();
+            let content_box = content_box.clone();
+            super::key_capture::show_capture_dialog(btn, move |key: &str| {
+                let key = key.to_string();
+                update_buff(&cfg, idx, |b| b.watch_keys.push(key));
+                engine.reload_profile();
+                render(&content_box, &cfg, &engine);
+            });
         });
         wk_box.append(&add_wk_btn);
     }

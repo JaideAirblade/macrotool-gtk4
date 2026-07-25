@@ -346,11 +346,16 @@ fn make_macro_card(
         let engine = engine.clone();
         let content_box = content_box.clone();
         let add_key_btn = Button::with_label("+ Key");
-        add_key_btn.connect_clicked(move |_| {
-            // Append a placeholder key the user can edit in config or via picker later
-            update_macro(&cfg, idx, |m| m.keys.push("a".into()));
-            engine.reload_profile();
-            render(&content_box, &cfg, &engine);
+        add_key_btn.connect_clicked(move |btn| {
+            let cfg = cfg.clone();
+            let engine = engine.clone();
+            let content_box = content_box.clone();
+            super::key_capture::show_capture_dialog(btn, move |key: &str| {
+                let key = key.to_string();
+                update_macro(&cfg, idx, |m| m.keys.push(key));
+                engine.reload_profile();
+                render(&content_box, &cfg, &engine);
+            });
         });
         keys_box.append(&add_key_btn);
     }
