@@ -5,8 +5,7 @@
 //! - Right-click a row → context menu (Add class/spec, Rename, Delete)
 //! - "+" header button → add a new game
 
-use crate::config::{Class, ConfigTree, Game, Spec};
-use gtk4::gio;
+use crate::config::{Class, Game, Spec};
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, Entry, GestureClick, Label, ListBox, ListBoxRow, Orientation, Popover,
@@ -397,6 +396,9 @@ fn add_child(cfg: &Arc<crate::config::Manager>, node: &Node, name: &str) {
                         icon: String::new(),
                     },
                 );
+                tree.active_game = g.clone();
+                tree.active_class = name.to_string();
+                tree.active_spec.clear();
             }
         }
         Node::Class(g, c) => {
@@ -411,6 +413,9 @@ fn add_child(cfg: &Arc<crate::config::Manager>, node: &Node, name: &str) {
                             detect: None,
                         },
                     );
+                    tree.active_game = g.clone();
+                    tree.active_class = c.clone();
+                    tree.active_spec = name.to_string();
                 }
             }
         }
@@ -696,4 +701,46 @@ fn rebuild_list(
 /// Placeholder callback used where only list-restyling is needed inline.
 fn on_changed_placeholder() -> Rc<dyn Fn()> {
     Rc::new(|| {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_child, Node};
+    use crate::config::{Class, ConfigTree, Game, Manager};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn adding_a_spec_selects_it_immediately() {
+        let cfg = Arc::new(Manager::new());
+        let mut tree = ConfigTree::default();
+        tree.games.insert(
+            "Game".into(),
+            Game {
+                path: String::new(),
+                classes: BTreeMap::from([(
+                    "Class".into(),
+                    Class {
+                        specs: BTreeMap::new(),
+                        icon: String::new(),
+                    },
+                )]),
+            },
+        );
+        cfg.set_tree(tree);
+
+        add_child(
+            &cfg,
+            &Node::Class("Game".into(), "Class".into()),
+            "New Spec",
+        );
+
+        let tree = cfg.tree();
+        assert!(tree.games["Game"].classes["Class"]
+            .specs
+            .contains_key("New Spec"));
+        assert_eq!(tree.active_game, "Game");
+        assert_eq!(tree.active_class, "Class");
+        assert_eq!(tree.active_spec, "New Spec");
+    }
 }

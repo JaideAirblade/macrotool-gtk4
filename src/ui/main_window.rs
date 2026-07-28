@@ -10,23 +10,53 @@
 //!   │              │                                 │
 //!   └──────────────┴────────────────────────────────┘
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    ApplicationWindow, Button, HeaderBar, Label, Notebook, Orientation, Paned, PolicyType,
-    ScrolledWindow,
+    ApplicationWindow, HeaderBar, Label, Notebook, Orientation, Paned, PolicyType, ScrolledWindow,
 };
 
 use crate::config;
 use crate::engine;
 use crate::ui::buffs_tab::BuffsTab;
 use crate::ui::macros_tab::MacrosTab;
+use crate::ui::overlay::Overlay;
 use crate::ui::procs_tab::ProcsTab;
 use crate::ui::settings_tab::SettingsTab;
 use crate::ui::sidebar::Sidebar;
-use crate::ui::overlay::Overlay;
-use std::rc::Rc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDisposition {
+    HideToTray,
+    Quit,
+}
+
+fn close_disposition(minimize_to_tray: bool, tray_available: bool) -> CloseDisposition {
+    if minimize_to_tray && tray_available {
+        CloseDisposition::HideToTray
+    } else {
+        CloseDisposition::Quit
+    }
+}
+
+fn handle_close(
+    window: &ApplicationWindow,
+    app: &gtk4::Application,
+    cfg: &Arc<config::Manager>,
+    tray_available: &Arc<AtomicBool>,
+) {
+    match close_disposition(
+        cfg.settings().minimize_to_tray,
+        tray_available.load(Ordering::Acquire),
+    ) {
+        CloseDisposition::HideToTray => window.set_visible(false),
+        CloseDisposition::Quit => app.quit(),
+    }
+}
 
 pub struct MainWindow {
     window: ApplicationWindow,
@@ -41,7 +71,12 @@ pub struct MainWindow {
 }
 
 impl MainWindow {
-    pub fn new(app: &gtk4::Application, cfg: Arc<config::Manager>, engine: Arc<engine::EngineHub>) -> Self {
+    pub fn new(
+        app: &gtk4::Application,
+        cfg: Arc<config::Manager>,
+        engine: Arc<engine::EngineHub>,
+        tray_available: Arc<AtomicBool>,
+    ) -> Self {
         let window = ApplicationWindow::builder()
             .application(app)
             .title("Macrotool")
@@ -53,15 +88,7 @@ impl MainWindow {
         // Header bar — no theme toggle, let the desktop environment handle it
         let title_label = Label::new(Some("Macrotool"));
         let header = HeaderBar::builder().title_widget(&title_label).build();
-
-        let min_btn = Button::with_label("—");
-        min_btn.set_tooltip_text(Some("Minimize"));
-        header.pack_end(&min_btn);
-
-        let close_btn = Button::with_label("✕");
-        close_btn.set_tooltip_text(Some("Hide to tray"));
-        header.pack_end(&close_btn);
-
+        header.set_show_title_buttons(true);
         window.set_titlebar(Some(&header));
 
         // Body: horizontal Paned (sidebar | notebook)
@@ -82,18 +109,30 @@ impl MainWindow {
 
         // Sidebar — on_changed refreshes the tabs + sidebar after any
         // selection/rename/add/delete
+        let sidebar_slot = Rc::new(RefCell::new(std::rc::Weak::<Sidebar>::new()));
         let sidebar = Rc::new(Sidebar::new(cfg.clone(), engine.clone(), {
             let cfg = cfg.clone();
             let engine = engine.clone();
             let macros_tab = macros_tab.clone();
             let procs_tab = procs_tab.clone();
             let buffs_tab = buffs_tab.clone();
+            let sidebar_slot = sidebar_slot.clone();
             Rc::new(move || {
                 macros_tab.refresh(&cfg, &engine);
                 procs_tab.refresh(&cfg, &engine);
                 buffs_tab.refresh(&cfg, &engine);
+
+                // Sidebar mutations can happen from a row's own signal. Wait
+                // until that signal returns before replacing its rows.
+                let sidebar = sidebar_slot.borrow().clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(sidebar) = sidebar.upgrade() {
+                        sidebar.refresh();
+                    }
+                });
             })
         }));
+        *sidebar_slot.borrow_mut() = Rc::downgrade(&sidebar);
 
         append_tab(&notebook, "Macros", macros_tab.widget());
         append_tab(&notebook, "Pixel Triggers", procs_tab.widget());
@@ -110,28 +149,23 @@ impl MainWindow {
         paned.set_end_child(Some(&notebook));
         window.set_child(Some(&paned));
 
-        // Minimize
-        let win_min = window.clone();
-        min_btn.connect_clicked(move |_| {
-            win_min.minimize();
-        });
-
-        // Close → hide (tray)
-        let win_close = window.clone();
-        close_btn.connect_clicked(move |_| {
-            win_close.set_visible(false);
-        });
-
+        // The native GTK close button hides only when a real tray is available
+        // and the setting is enabled. Otherwise it genuinely quits.
         let win_cr = window.clone();
+        let app_cr = app.clone();
+        let cfg_cr = cfg.clone();
+        let tray_available_cr = tray_available.clone();
         window.connect_close_request(move |_| {
-            win_cr.set_visible(false);
+            handle_close(&win_cr, &app_cr, &cfg_cr, &tray_available_cr);
             glib::Propagation::Stop
         });
 
-        // ── Overlay (layer-shell, stays on top) ─────────────────────
-        let overlay = Overlay::new(cfg.clone(), engine.clone());
-        overlay.set_position("top-left");
-        overlay.show();
+        // ── QML overlay (Quickshell layer-shell child) ──────────────
+        let overlay = Overlay::new(
+            cfg.clone(),
+            engine.clone(),
+            window.clone().upcast::<gtk4::Widget>(),
+        );
 
         Self {
             window,
@@ -172,16 +206,28 @@ impl MainWindow {
 
     /// Destroy the overlay so it disappears immediately on exit.
     pub fn close(&self) {
-        self.overlay.destroy();
+        self.overlay.shutdown();
     }
 
-    /// Get the overlay window (for external shutdown wiring).
-    pub fn overlay_window(&self) -> gtk4::Window {
-        self.overlay.window().clone()
+    pub fn overlay_handle(&self) -> Overlay {
+        self.overlay.clone()
     }
 }
 
 fn append_tab(notebook: &Notebook, label: &str, content: &gtk4::Widget) {
     let tab_label = Label::new(Some(label));
     notebook.append_page(content, Some(&tab_label));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{close_disposition, CloseDisposition};
+
+    #[test]
+    fn close_only_hides_when_minimize_to_tray_is_enabled_and_tray_exists() {
+        assert_eq!(close_disposition(true, true), CloseDisposition::HideToTray);
+        assert_eq!(close_disposition(false, true), CloseDisposition::Quit);
+        assert_eq!(close_disposition(true, false), CloseDisposition::Quit);
+        assert_eq!(close_disposition(false, false), CloseDisposition::Quit);
+    }
 }

@@ -9,3 +9,4 @@ pub mod buffs_tab;
 pub mod settings_tab;
 pub mod key_capture;
 pub mod overlay;
+pub mod tray;
