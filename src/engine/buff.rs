@@ -8,6 +8,8 @@ use crate::engine::macro_engine::EngineHandle;
 use crate::platform;
 use parking_lot::Mutex;
 use std::collections::{BinaryHeap, HashMap};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -21,12 +23,19 @@ struct BuffEntry {
     duration: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiryAction {
+    FireActionKey,
+    SoundOnly,
+}
+
 #[derive(Clone)]
 struct BuffHeapItem {
     expire: Instant,
     gen: u64,
     name: String,
     buff: BuffTimer,
+    action: ExpiryAction,
 }
 
 // Min-heap by expire time (reverse Ord for BinaryHeap which is max-heap)
@@ -80,8 +89,22 @@ impl BuffEngine {
         *self.handle.lock() = Some(handle);
     }
 
-    /// Activate or refresh a buff timer.
+    /// Activate a normal buff timer. Expiry presses its configured action key.
     pub fn activate(&self, buff: BuffTimer) {
+        self.schedule(buff, ExpiryAction::FireActionKey);
+    }
+
+    /// Start a manual cooldown reminder. It uses the buff's configured duration,
+    /// shows the usual countdown, and plays a sound on expiry without pressing
+    /// the buff's action key.
+    pub fn start_reminder(&self, mut buff: BuffTimer) {
+        // A manual click always starts a fresh countdown, even when the buff's
+        // automatic trigger is configured to ignore or extend refreshes.
+        buff.on_refresh = "reset".into();
+        self.schedule(buff, ExpiryAction::SoundOnly);
+    }
+
+    fn schedule(&self, buff: BuffTimer, action: ExpiryAction) {
         let name = buff.name.clone();
         let new_duration = Duration::from_millis(buff.duration.max(0) as u64);
 
@@ -89,7 +112,6 @@ impl BuffEngine {
         let gen = self.gen.fetch_add(1, Ordering::AcqRel);
         let now = Instant::now();
 
-        // Check for existing entry
         if let Some(existing) = shared.entries.get(&name) {
             let on_refresh = buff.on_refresh.as_str();
             if on_refresh == "ignore" {
@@ -117,6 +139,7 @@ impl BuffEngine {
                 gen,
                 name: name.clone(),
                 buff,
+                action,
             });
         } else {
             let expire = now + new_duration;
@@ -134,6 +157,7 @@ impl BuffEngine {
                 gen,
                 name: name.clone(),
                 buff,
+                action,
             });
         }
         drop(shared);
@@ -227,42 +251,86 @@ fn buff_worker(
             (fired, sleep_dur)
         };
 
-        // Fire the expired buff's action key
         if let Some(item) = to_fire {
-            if !item.buff.action_key.is_empty() {
-                if let Some(ref h) = handle {
-                    h.input.acquire_sending();
-                    // Buffs always fire — use uinput if game is foreground, global injection
-                    // if game is alive but backgrounded.
-                    let game_pid = h.detector.game_pid();
-                    let game_hwnd = if game_pid != 0 {
-                        h.detector.get_cached_hwnd()
-                    } else {
-                        platform::INVALID_WINDOW_HANDLE
-                    };
-
-                    let game_foreground = is_game_foreground(game_pid);
-                    if game_foreground {
-                        platform::send_key(&item.buff.action_key);
-                    } else if !game_hwnd.is_null() {
-                        platform::send_key_to_window(game_hwnd, &item.buff.action_key);
-                    }
-                    h.input.release_sending();
-                } else {
-                    // No handle — just send directly
-                    platform::send_key(&item.buff.action_key);
-                }
+            match item.action {
+                ExpiryAction::FireActionKey => fire_buff_action_key(&item, handle.as_ref()),
+                ExpiryAction::SoundOnly => play_cooldown_ready_sound(&item.name),
             }
-            log::info!(
-                "[buff] expired: {} → fired {}",
-                item.name,
-                item.buff.action_key
-            );
         }
 
         // Sleep until next expiry or timeout
         thread::sleep(sleep_dur);
     }
+}
+
+fn fire_buff_action_key(item: &BuffHeapItem, handle: Option<&EngineHandle>) {
+    if item.buff.action_key.is_empty() {
+        return;
+    }
+
+    if let Some(h) = handle {
+        h.input.acquire_sending();
+        // Buffs always fire — use uinput if game is foreground, global injection
+        // if game is alive but backgrounded.
+        let game_pid = h.detector.game_pid();
+        let game_hwnd = if game_pid != 0 {
+            h.detector.get_cached_hwnd()
+        } else {
+            platform::INVALID_WINDOW_HANDLE
+        };
+
+        if is_game_foreground(game_pid) {
+            platform::send_key(&item.buff.action_key);
+        } else if !game_hwnd.is_null() {
+            platform::send_key_to_window(game_hwnd, &item.buff.action_key);
+        }
+        h.input.release_sending();
+    } else {
+        // No handle — just send directly.
+        platform::send_key(&item.buff.action_key);
+    }
+    log::info!(
+        "[buff] expired: {} → fired {}",
+        item.name,
+        item.buff.action_key
+    );
+}
+
+fn cooldown_sound_path() -> Option<PathBuf> {
+    let relative = "sounds/freedesktop/stereo/complete.oga";
+    let mut candidates = vec![
+        PathBuf::from("/run/current-system/sw/share").join(relative),
+        PathBuf::from("/usr/share").join(relative),
+    ];
+    if let Ok(data_dirs) = std::env::var("XDG_DATA_DIRS") {
+        candidates.extend(
+            data_dirs
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| PathBuf::from(dir).join(relative)),
+        );
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn play_cooldown_ready_sound(name: &str) {
+    let Some(sound) = cooldown_sound_path() else {
+        log::warn!("[buff] cooldown ready for {name}, but no completion sound was found");
+        return;
+    };
+    let player = if std::path::Path::new("/run/current-system/sw/bin/pw-play").is_file() {
+        PathBuf::from("/run/current-system/sw/bin/pw-play")
+    } else {
+        PathBuf::from("pw-play")
+    };
+    let name = name.to_string();
+    let _ = thread::Builder::new()
+        .name("buff-reminder-sound".into())
+        .spawn(move || match Command::new(player).arg(sound).status() {
+            Ok(status) if status.success() => log::info!("[buff] cooldown ready: {name}"),
+            Ok(status) => log::warn!("[buff] cooldown sound exited with {status}: {name}"),
+            Err(error) => log::warn!("[buff] could not play cooldown sound for {name}: {error}"),
+        });
 }
 
 fn is_game_foreground(game_pid: u32) -> bool {
@@ -272,4 +340,30 @@ fn is_game_foreground(game_pid: u32) -> bool {
     let fg = platform::get_foreground_window();
     let (_, fg_pid) = platform::get_window_thread_process_id(fg);
     fg_pid == game_pid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BuffEngine, ExpiryAction};
+    use crate::config::BuffTimer;
+
+    #[test]
+    fn manual_reminder_queues_a_sound_without_pressing_the_action_key() {
+        let engine = BuffEngine::new();
+        let mut buff = BuffTimer::default();
+        buff.name = "Cooldown reminder".into();
+        buff.action_key = "f".into();
+        buff.duration = 60_000;
+
+        engine.start_reminder(buff);
+        let queued = engine
+            .shared
+            .lock()
+            .heap
+            .peek()
+            .cloned()
+            .expect("queued reminder");
+        assert_eq!(queued.action, ExpiryAction::SoundOnly);
+        engine.stop();
+    }
 }

@@ -5,7 +5,8 @@ use crate::config::{BuffTimer, Spec};
 use crate::ui::key_capture::KeyCapture;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, ComboBoxText, Entry, Label, Orientation, ScrolledWindow, SpinButton, Switch,
+    Box as GtkBox, Button, ComboBoxText, Entry, Label, Orientation, ScrolledWindow, SpinButton,
+    Switch,
 };
 use std::sync::Arc;
 
@@ -31,12 +32,19 @@ impl BuffsTab {
         scrolled.set_child(Some(&content_box));
         container.append(&scrolled);
 
-        let tab = BuffsTab { container, content_box };
+        let tab = BuffsTab {
+            container,
+            content_box,
+        };
         tab.refresh(&cfg, &engine);
         tab
     }
 
-    pub fn refresh(&self, cfg: &Arc<crate::config::Manager>, engine: &Arc<crate::engine::EngineHub>) {
+    pub fn refresh(
+        &self,
+        cfg: &Arc<crate::config::Manager>,
+        engine: &Arc<crate::engine::EngineHub>,
+    ) {
         render(&self.content_box, cfg, engine);
     }
 
@@ -184,6 +192,19 @@ fn make_buff_card(
     }
     header.append(&badge);
 
+    let reminder_btn = Button::with_label("Start sound reminder");
+    reminder_btn.set_tooltip_text(Some(
+        "Starts a sound-only countdown using Duration (ms); it will not press Action Key.",
+    ));
+    {
+        let buffs = engine.buffs.clone();
+        let reminder = b.clone();
+        reminder_btn.connect_clicked(move |_| {
+            buffs.start_reminder(reminder.clone());
+        });
+    }
+    header.append(&reminder_btn);
+
     {
         let cfg = cfg.clone();
         let engine = engine.clone();
@@ -307,7 +328,11 @@ fn make_buff_card(
     let trig_combo = ComboBoxText::new();
     trig_combo.append(Some("keys"), "Keys");
     trig_combo.append(Some("pixel"), "Pixel");
-    trig_combo.set_active_id(Some(if b.trigger_type == "pixel" { "pixel" } else { "keys" }));
+    trig_combo.set_active_id(Some(if b.trigger_type == "pixel" {
+        "pixel"
+    } else {
+        "keys"
+    }));
     {
         let cfg = cfg.clone();
         let engine = engine.clone();

@@ -108,7 +108,10 @@ impl MacroEngine {
         self.handle.input.on_event(Box::new(move |key, transition| {
             let profile_map = handle.cfg.get_macros();
             let hk = key.to_lowercase();
-            let m = match profile_map.iter().find(|mac| mac.hotkey.to_lowercase() == hk) {
+            let m = match profile_map
+                .iter()
+                .find(|mac| mac.hotkey.to_lowercase() == hk)
+            {
                 Some(m) => m.clone(),
                 None => return,
             };
@@ -205,6 +208,10 @@ fn stop_macro(
     }
 }
 
+fn configured_hold_duration(seconds: i32) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
+}
+
 fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHandle) {
     platform::set_macro_thread_affinity();
     platform::set_thread_priority_above_normal();
@@ -221,11 +228,7 @@ fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHan
     }
     let ikd = m.inter_key_delay;
     let start = Instant::now();
-    let max_duration = if m.max_hold_duration > 0 {
-        Duration::from_secs(m.max_hold_duration as u64)
-    } else {
-        Duration::from_secs(60) // safety timeout — 60s max per hold/toggle cycle
-    };
+    let max_duration = configured_hold_duration(m.max_hold_duration);
 
     loop {
         // The stop_flag IS the running flag: true = running, false = stop requested.
@@ -268,8 +271,10 @@ fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHan
         send_key_sequence(&keys, ikd, &stop_flag, &handle, m.background);
         handle.input.release_sending();
 
-        if start.elapsed() > max_duration {
-            break;
+        if let Some(max_duration) = max_duration {
+            if start.elapsed() > max_duration {
+                break;
+            }
         }
 
         // Sleep for the interval
@@ -372,4 +377,20 @@ pub(crate) fn is_game_foreground(game_pid: u32) -> bool {
     let fg = platform::get_foreground_window();
     let (_, fg_pid) = platform::get_window_thread_process_id(fg);
     fg_pid == game_pid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured_hold_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn zero_hold_duration_means_no_automatic_timeout() {
+        assert_eq!(configured_hold_duration(0), None);
+    }
+
+    #[test]
+    fn explicit_hold_duration_remains_supported() {
+        assert_eq!(configured_hold_duration(90), Some(Duration::from_secs(90)));
+    }
 }
