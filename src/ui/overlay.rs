@@ -57,6 +57,7 @@ struct OverlayState {
     buffs: Vec<OverlayBuff>,
     game_active: bool,
     game_alive: bool,
+    overlay_position: String,
     theme: ThemePalette,
 }
 
@@ -332,6 +333,7 @@ fn build_state(
         buffs,
         game_active: engine.detector.is_active(cfg),
         game_alive: engine.detector.is_game_alive(),
+        overlay_position: cfg.settings().overlay_position,
         theme: ThemePalette::from_widget(theme_widget),
     }
 }
@@ -475,6 +477,18 @@ mod tests {
         assert!(qml.contains("palette.windowText"));
         assert!(!qml.contains("#101018"));
         assert!(!qml.contains("#eeeeee"));
+    }
+
+    #[test]
+    fn qml_overlay_sizes_to_its_content_and_uses_the_saved_position() {
+        let qml = include_str!("../../qml/overlay/shell.qml");
+        assert!(qml.contains("implicitWidth: card.implicitWidth"));
+        assert!(!qml.contains("implicitWidth: 320"));
+        assert!(qml.contains("root.state.overlayPosition"));
+        assert!(qml.contains("top-left"));
+        assert!(qml.contains("top-right"));
+        assert!(qml.contains("bottom-left"));
+        assert!(qml.contains("bottom-right"));
     }
 
     #[test]

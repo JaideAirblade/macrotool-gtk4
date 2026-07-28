@@ -15,7 +15,8 @@ ShellRoot {
         macros: [],
         buffs: [],
         gameActive: false,
-        gameAlive: false
+        gameAlive: false,
+        overlayPosition: "top-left"
     })
     property bool stateLoaded: false
     readonly property string statePath: Quickshell.env("MACROTOOL_OVERLAY_STATE") || ""
@@ -78,23 +79,28 @@ ShellRoot {
     readonly property color highlightColor: gtkTheme.highlight || palette.highlight
     readonly property color highlightedTextColor: gtkTheme.highlightedText || palette.highlightedText
     readonly property color midColor: gtkTheme.mid || palette.mid
+    readonly property string overlayPosition: root.state.overlayPosition || "top-left"
 
     PanelWindow {
         id: overlayWindow
-        visible: root.stateLoaded
-        implicitWidth: 320
+        visible: root.stateLoaded && root.overlayPosition !== "hidden"
+        implicitWidth: card.implicitWidth
         implicitHeight: card.implicitHeight
         color: "transparent"
         exclusionMode: ExclusionMode.Ignore
         aboveWindows: true
         focusable: false
         anchors {
-            top: true
-            left: true
+            top: root.overlayPosition === "top-left" || root.overlayPosition === "top-right"
+            bottom: root.overlayPosition === "bottom-left" || root.overlayPosition === "bottom-right"
+            left: root.overlayPosition === "top-left" || root.overlayPosition === "bottom-left"
+            right: root.overlayPosition === "top-right" || root.overlayPosition === "bottom-right"
         }
         margins {
             top: 10
             left: 10
+            bottom: 10
+            right: 10
         }
         mask: Region {}
 
@@ -105,6 +111,7 @@ ShellRoot {
         Rectangle {
             id: card
             width: overlayWindow.width
+            implicitWidth: body.implicitWidth + 24
             implicitHeight: body.implicitHeight + 24
             radius: 12
             color: Qt.rgba(root.windowColor.r, root.windowColor.g, root.windowColor.b, 0.90)
@@ -169,6 +176,7 @@ ShellRoot {
 
                         Rectangle {
                             width: Math.max(42, hotkeyText.implicitWidth + 12)
+                            implicitWidth: Math.max(42, hotkeyText.implicitWidth + 12)
                             height: 20
                             radius: 4
                             color: modelData.running
@@ -232,6 +240,7 @@ ShellRoot {
 
                         Rectangle {
                             width: body.width - 116
+                            implicitWidth: 80
                             height: 6
                             anchors.verticalCenter: parent.verticalCenter
                             radius: 3

@@ -227,6 +227,8 @@ pub struct Settings {
     pub pixel_check_rate: i32,
     #[serde(rename = "showTerminal", default)]
     pub show_terminal: bool,
+    #[serde(rename = "overlayPosition", default = "default_overlay_position")]
+    pub overlay_position: String,
 }
 
 impl Default for Settings {
@@ -241,6 +243,7 @@ impl Default for Settings {
             toggle_key: "ScrollLock".into(),
             pixel_check_rate: 250,
             show_terminal: false,
+            overlay_position: default_overlay_position(),
         }
     }
 }
@@ -256,6 +259,9 @@ fn default_250() -> i32 {
 }
 fn default_toggle_key() -> String {
     "ScrollLock".to_string()
+}
+fn default_overlay_position() -> String {
+    "top-left".to_string()
 }
 
 impl Settings {}
@@ -509,7 +515,9 @@ fn config_dir() -> PathBuf {
         return PathBuf::from(cfg).join("Jaides_Macro_tool");
     }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config").join("Jaides_Macro_tool");
+        return PathBuf::from(home)
+            .join(".config")
+            .join("Jaides_Macro_tool");
     }
     PathBuf::from(".").join("Jaides_Macro_tool")
 }
@@ -542,6 +550,8 @@ fn parse_settings(node: &Node, tree: &mut ConfigTree) {
     s.toggle_key = node.prop_str("toggleKey", &s.toggle_key.clone());
     s.pixel_check_rate = node.prop_int("pixelCheckRate", s.pixel_check_rate as i64) as i32;
     s.show_terminal = node.prop_bool("showTerminal", s.show_terminal);
+    s.overlay_position =
+        normalize_overlay_position(&node.prop_str("overlayPosition", &s.overlay_position.clone()));
 }
 
 fn parse_game(node: &Node, tree: &mut ConfigTree) {
@@ -771,6 +781,7 @@ fn build_doc(tree: &ConfigTree) -> Document {
     s_node.set_str("toggleKey", &s.toggle_key);
     s_node.set_int("pixelCheckRate", s.pixel_check_rate as i64);
     s_node.set_bool("showTerminal", s.show_terminal);
+    s_node.set_str("overlayPosition", &s.overlay_position);
     nodes.push(s_node);
 
     // active
@@ -921,6 +932,7 @@ fn pixel_node(px: &Pixel) -> Node {
 // ── Validation ──────────────────────────────────────────────────────────
 
 fn validate(tree: &mut ConfigTree) {
+    tree.settings.overlay_position = normalize_overlay_position(&tree.settings.overlay_position);
     for g in tree.games.values_mut() {
         for c in g.classes.values_mut() {
             for s in c.specs.values_mut() {
@@ -974,5 +986,14 @@ fn validate(tree: &mut ConfigTree) {
                 }
             }
         }
+    }
+}
+
+fn normalize_overlay_position(position: &str) -> String {
+    match position {
+        "top-left" | "top-right" | "bottom-left" | "bottom-right" | "hidden" => {
+            position.to_string()
+        }
+        _ => default_overlay_position(),
     }
 }

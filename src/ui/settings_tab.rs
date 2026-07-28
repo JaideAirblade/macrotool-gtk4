@@ -3,9 +3,7 @@
 use crate::config::Settings;
 use crate::ui::key_capture::KeyCapture;
 use gtk4::prelude::*;
-use gtk4::{
-    Box as GtkBox, Label, Orientation, ScrolledWindow, SpinButton, Switch,
-};
+use gtk4::{Box as GtkBox, ComboBoxText, Label, Orientation, ScrolledWindow, SpinButton, Switch};
 use std::sync::Arc;
 
 pub struct SettingsTab {
@@ -142,18 +140,42 @@ fn make_general_card(
     });
     card.append(&field_row("Toggle Key", toggle_cap.widget()));
 
-    card.append(&toggle_row("Only in Game", s.only_in_game, cfg, Some(engine.clone()), |s, v| {
-        s.only_in_game = v;
-    }));
-    card.append(&toggle_row("Allow Background", s.allow_background, cfg, Some(engine.clone()), |s, v| {
-        s.allow_background = v;
-    }));
-    card.append(&toggle_row("Auto Detect Game", s.auto_detect_game, cfg, Some(engine.clone()), |s, v| {
-        s.auto_detect_game = v;
-    }));
-    card.append(&toggle_row("Minimize to Tray", s.minimize_to_tray, cfg, None, |s, v| {
-        s.minimize_to_tray = v;
-    }));
+    card.append(&toggle_row(
+        "Only in Game",
+        s.only_in_game,
+        cfg,
+        Some(engine.clone()),
+        |s, v| {
+            s.only_in_game = v;
+        },
+    ));
+    card.append(&toggle_row(
+        "Allow Background",
+        s.allow_background,
+        cfg,
+        Some(engine.clone()),
+        |s, v| {
+            s.allow_background = v;
+        },
+    ));
+    card.append(&toggle_row(
+        "Auto Detect Game",
+        s.auto_detect_game,
+        cfg,
+        Some(engine.clone()),
+        |s, v| {
+            s.auto_detect_game = v;
+        },
+    ));
+    card.append(&toggle_row(
+        "Minimize to Tray",
+        s.minimize_to_tray,
+        cfg,
+        None,
+        |s, v| {
+            s.minimize_to_tray = v;
+        },
+    ));
 
     card
 }
@@ -163,6 +185,29 @@ fn make_appearance_card(s: &Settings, cfg: &Arc<crate::config::Manager>) -> gtk4
     card.append(&toggle_row("Dark Mode", s.dark_mode, cfg, None, |s, v| {
         s.dark_mode = v;
     }));
+
+    let position = ComboBoxText::new();
+    for (id, label) in [
+        ("top-left", "Top left"),
+        ("top-right", "Top right"),
+        ("bottom-left", "Bottom left"),
+        ("bottom-right", "Bottom right"),
+        ("hidden", "Hidden"),
+    ] {
+        position.append(Some(id), label);
+    }
+    position.set_active_id(Some(&s.overlay_position));
+    {
+        let cfg = cfg.clone();
+        position.connect_changed(move |combo| {
+            if let Some(id) = combo.active_id() {
+                let position = id.to_string();
+                set_setting(&cfg, |s| s.overlay_position = position);
+            }
+        });
+    }
+    card.append(&field_row("Overlay Position", &position));
+
     card
 }
 
@@ -185,8 +230,14 @@ fn make_pixel_card(s: &Settings, cfg: &Arc<crate::config::Manager>) -> gtk4::Box
 
 fn make_advanced_card(s: &Settings, cfg: &Arc<crate::config::Manager>) -> gtk4::Box {
     let card = make_card("Advanced");
-    card.append(&toggle_row("Show Terminal", s.show_terminal, cfg, None, |s, v| {
-        s.show_terminal = v;
-    }));
+    card.append(&toggle_row(
+        "Show Terminal",
+        s.show_terminal,
+        cfg,
+        None,
+        |s, v| {
+            s.show_terminal = v;
+        },
+    ));
     card
 }
