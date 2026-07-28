@@ -132,6 +132,8 @@ pub struct BuffTimer {
     pub extend_ms: i32,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(rename = "soundOnExpiry", default)]
+    pub sound_on_expiry: bool,
     #[serde(rename = "triggerType", default = "default_keys")]
     pub trigger_type: String,
     #[serde(rename = "triggerPixels", default)]
@@ -152,6 +154,7 @@ impl Default for BuffTimer {
             on_refresh: "reset".into(),
             extend_ms: 0,
             enabled: true,
+            sound_on_expiry: false,
             trigger_type: "keys".into(),
             trigger_pixels: Vec::new(),
             trigger_match_mode: "all".into(),
@@ -721,6 +724,7 @@ fn parse_buff(node: &Node) -> BuffTimer {
         on_refresh: node.prop_str("onRefresh", "reset"),
         extend_ms: node.prop_int("extendMs", 0) as i32,
         enabled: node.prop_bool("enabled", true),
+        sound_on_expiry: node.prop_bool("soundOnExpiry", false),
         trigger_type: node.prop_str("triggerType", "keys"),
         trigger_pixels: pixels,
         trigger_match_mode: node.prop_str("triggerMatchMode", "all"),
@@ -894,6 +898,7 @@ fn build_doc(tree: &ConfigTree) -> Document {
                     b_node.set_str("onRefresh", &b.on_refresh);
                     b_node.set_int("extendMs", b.extend_ms as i64);
                     b_node.set_bool("enabled", b.enabled);
+                    b_node.set_bool("soundOnExpiry", b.sound_on_expiry);
                     b_node.set_str("triggerMatchMode", &b.trigger_match_mode);
                     let cr = res_str(&b.capture_res);
                     if !cr.is_empty() {

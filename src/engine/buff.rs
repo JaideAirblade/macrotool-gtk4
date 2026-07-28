@@ -25,7 +25,7 @@ struct BuffEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpiryAction {
-    FireActionKey,
+    FireActionKey { play_sound: bool },
     SoundOnly,
 }
 
@@ -91,7 +91,8 @@ impl BuffEngine {
 
     /// Activate a normal buff timer. Expiry presses its configured action key.
     pub fn activate(&self, buff: BuffTimer) {
-        self.schedule(buff, ExpiryAction::FireActionKey);
+        let play_sound = buff.sound_on_expiry;
+        self.schedule(buff, ExpiryAction::FireActionKey { play_sound });
     }
 
     /// Start a manual cooldown reminder. It uses the buff's configured duration,
@@ -253,7 +254,12 @@ fn buff_worker(
 
         if let Some(item) = to_fire {
             match item.action {
-                ExpiryAction::FireActionKey => fire_buff_action_key(&item, handle.as_ref()),
+                ExpiryAction::FireActionKey { play_sound } => {
+                    fire_buff_action_key(&item, handle.as_ref());
+                    if play_sound {
+                        play_cooldown_ready_sound(&item.name);
+                    }
+                }
                 ExpiryAction::SoundOnly => play_cooldown_ready_sound(&item.name),
             }
         }
@@ -364,6 +370,30 @@ mod tests {
             .cloned()
             .expect("queued reminder");
         assert_eq!(queued.action, ExpiryAction::SoundOnly);
+        engine.stop();
+    }
+
+    #[test]
+    fn watched_key_buff_can_play_a_sound_when_its_countdown_expires() {
+        let engine = BuffEngine::new();
+        let mut buff = BuffTimer::default();
+        buff.name = "BlueBuff".into();
+        buff.action_key = "v".into();
+        buff.duration = 60_000;
+        buff.sound_on_expiry = true;
+
+        engine.activate(buff);
+        let queued = engine
+            .shared
+            .lock()
+            .heap
+            .peek()
+            .cloned()
+            .expect("queued automatic buff");
+        assert_eq!(
+            queued.action,
+            ExpiryAction::FireActionKey { play_sound: true }
+        );
         engine.stop();
     }
 }

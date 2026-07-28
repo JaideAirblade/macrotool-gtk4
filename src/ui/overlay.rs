@@ -492,6 +492,19 @@ mod tests {
     }
 
     #[test]
+    fn qml_overlay_profile_header_contributes_its_full_natural_width() {
+        let qml = include_str!("../../qml/overlay/shell.qml");
+        assert!(qml.contains("id: profileHeader"));
+        assert!(qml.contains("id: profileRow"));
+        assert!(qml.contains(
+            "implicitWidth: statusIndicator.implicitWidth + profileRow.spacing + profileTitle.implicitWidth"
+        ));
+        assert!(qml.contains(
+            "implicitWidth: Math.max(body.implicitWidth, profileHeader.implicitWidth) + 24"
+        ));
+    }
+
+    #[test]
     fn stopping_overlay_process_terminates_its_child() {
         let child = Command::new("sleep")
             .arg("30")

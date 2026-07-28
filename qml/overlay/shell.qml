@@ -111,7 +111,7 @@ ShellRoot {
         Rectangle {
             id: card
             width: overlayWindow.width
-            implicitWidth: body.implicitWidth + 24
+            implicitWidth: Math.max(body.implicitWidth, profileHeader.implicitWidth) + 24
             implicitHeight: body.implicitHeight + 24
             radius: 12
             color: Qt.rgba(root.windowColor.r, root.windowColor.g, root.windowColor.b, 0.90)
@@ -125,27 +125,39 @@ ShellRoot {
                 width: parent.width - 24
                 spacing: 7
 
-                Row {
+                Item {
+                    id: profileHeader
                     width: parent.width
-                    spacing: 8
+                    height: profileRow.implicitHeight
+                    implicitWidth: statusIndicator.implicitWidth + profileRow.spacing + profileTitle.implicitWidth
+                    implicitHeight: profileRow.implicitHeight
 
-                    Text {
-                        text: root.state.enabled ? "●" : "○"
-                        color: root.state.enabled ? root.highlightColor : root.midColor
-                        font.pixelSize: 14
-                    }
+                    Row {
+                        id: profileRow
+                        width: parent.width
+                        height: implicitHeight
+                        spacing: 8
 
-                    Text {
-                        width: parent.width - 24
-                        text: {
-                            const parts = [root.state.activeGame, root.state.activeClass, root.state.activeSpec]
-                                .filter(part => part && part.length > 0);
-                            return parts.length > 0 ? parts.join(" / ") : "No game selected";
+                        Text {
+                            id: statusIndicator
+                            text: root.state.enabled ? "●" : "○"
+                            color: root.state.enabled ? root.highlightColor : root.midColor
+                            font.pixelSize: 14
                         }
-                        color: root.windowTextColor
-                        font.bold: true
-                        font.pixelSize: 13
-                        elide: Text.ElideRight
+
+                        Text {
+                            id: profileTitle
+                            width: parent.width - statusIndicator.width - parent.spacing
+                            text: {
+                                const parts = [root.state.activeGame, root.state.activeClass, root.state.activeSpec]
+                                    .filter(part => part && part.length > 0);
+                                return parts.length > 0 ? parts.join(" / ") : "No game selected";
+                            }
+                            color: root.windowTextColor
+                            font.bold: true
+                            font.pixelSize: 13
+                            elide: Text.ElideRight
+                        }
                     }
                 }
 

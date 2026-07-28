@@ -142,6 +142,7 @@ fn add_buff(cfg: &Arc<crate::config::Manager>) {
             on_refresh: "reset".into(),
             extend_ms: 0,
             enabled: true,
+            sound_on_expiry: false,
             trigger_type: "keys".into(),
             trigger_pixels: Vec::new(),
             trigger_match_mode: "all".into(),
@@ -322,6 +323,20 @@ fn make_buff_card(
     }
     en_box.append(&en_sw);
     toggles.append(&en_box);
+
+    let sound_box = GtkBox::new(Orientation::Horizontal, 8);
+    sound_box.append(&Label::new(Some("Sound when ready")));
+    let sound_sw = Switch::new();
+    sound_sw.set_active(b.sound_on_expiry);
+    {
+        let cfg = cfg.clone();
+        sound_sw.connect_state_set(move |_, state| {
+            update_buff(&cfg, idx, |b| b.sound_on_expiry = state);
+            glib::Propagation::Proceed
+        });
+    }
+    sound_box.append(&sound_sw);
+    toggles.append(&sound_box);
 
     let trig_box = GtkBox::new(Orientation::Horizontal, 8);
     trig_box.append(&Label::new(Some("Trigger")));
