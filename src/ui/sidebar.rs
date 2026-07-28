@@ -130,7 +130,7 @@ impl Sidebar {
                 let class_active = tree.active_game == *game_name
                     && tree.active_class == *class_name
                     && tree.active_spec.is_empty();
-                let icon = if class.icon.is_empty() { "🖼" } else { "🖼" };
+                let icon = "🖼";
                 let row = self.make_row(
                     &format!("{}  {}", icon, class_name),
                     class_node.clone(),
@@ -141,7 +141,8 @@ impl Sidebar {
                 self.list.append(&row);
 
                 for spec_name in class.specs.keys() {
-                    let spec_node = Node::Spec(game_name.clone(), class_name.clone(), spec_name.clone());
+                    let spec_node =
+                        Node::Spec(game_name.clone(), class_name.clone(), spec_name.clone());
                     let spec_active = tree.active_game == *game_name
                         && tree.active_class == *class_name
                         && tree.active_spec == *spec_name;
@@ -257,6 +258,7 @@ impl Sidebar {
         {
             let right = GestureClick::new();
             right.set_button(3);
+            let menu_parent = row.clone();
             let cfg = self.cfg.clone();
             let engine = self.engine.clone();
             let on_changed = self.on_changed.clone();
@@ -265,7 +267,7 @@ impl Sidebar {
             let list = self.list.clone();
             right.connect_pressed(move |gesture, _, x, y| {
                 let menu = make_context_menu(
-                    &list,
+                    &menu_parent,
                     &node,
                     &cfg,
                     &engine,
@@ -427,7 +429,7 @@ fn add_child(cfg: &Arc<crate::config::Manager>, node: &Node, name: &str) {
 // ── Context menu ─────────────────────────────────────────────────────────
 
 fn make_context_menu(
-    parent: &impl IsA<gtk4::Widget>,
+    parent: &ListBoxRow,
     node: &Node,
     cfg: &Arc<crate::config::Manager>,
     engine: &Arc<crate::engine::EngineHub>,
@@ -436,7 +438,7 @@ fn make_context_menu(
     list: &ListBox,
 ) -> Popover {
     let pop = Popover::new();
-    pop.set_parent(parent);
+    anchor_context_menu(&pop, parent);
 
     let menu_box = GtkBox::new(Orientation::Vertical, 0);
 
@@ -455,8 +457,11 @@ fn make_context_menu(
             let node = node.clone();
             let list = list.clone();
             let renaming = renaming.clone();
-            let pop = pop.clone();
+            let pop = pop.downgrade();
             btn.connect_clicked(move |_| {
+                let Some(pop) = pop.upgrade() else {
+                    return;
+                };
                 pop.popdown();
                 show_add_child_dialog(&list, &cfg, &engine, &on_changed, &node, &renaming);
             });
@@ -471,8 +476,11 @@ fn make_context_menu(
         let node = node.clone();
         let list = list.clone();
         let cfg = cfg.clone();
-        let pop = pop.clone();
+        let pop = pop.downgrade();
         rename_btn.connect_clicked(move |_| {
+            let Some(pop) = pop.upgrade() else {
+                return;
+            };
             pop.popdown();
             *renaming.borrow_mut() = Some(node.clone());
             rebuild_list(&list, &cfg, &renaming, &on_changed_placeholder());
@@ -495,8 +503,11 @@ fn make_context_menu(
         let node = node.clone();
         let list = list.clone();
         let renaming = renaming.clone();
-        let pop = pop.clone();
+        let pop = pop.downgrade();
         del_btn.connect_clicked(move |_| {
+            let Some(pop) = pop.upgrade() else {
+                return;
+            };
             pop.popdown();
             delete_node(&cfg, &node);
             engine.reload_profile();
@@ -510,6 +521,15 @@ fn make_context_menu(
     pop
 }
 
+fn anchor_context_menu(popover: &Popover, row: &ListBoxRow) {
+    popover.set_parent(row);
+    popover.connect_closed(|popover| {
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+    });
+}
+
 // ── Dialogs ──────────────────────────────────────────────────────────────
 
 fn show_add_game_dialog(
@@ -521,7 +541,10 @@ fn show_add_game_dialog(
     let dialog = gtk4::Window::new();
     dialog.set_title(Some("Add Game"));
     dialog.set_modal(true);
-    if let Some(win) = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+    if let Some(win) = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    {
         dialog.set_transient_for(Some(&win));
     }
     dialog.set_default_size(320, 0);
@@ -705,10 +728,51 @@ fn on_changed_placeholder() -> Rc<dyn Fn()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_child, Node};
+    use super::{add_child, anchor_context_menu, Node};
     use crate::config::{Class, ConfigTree, Game, Manager};
+    use gtk4::prelude::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn adding_a_class_selects_it_immediately() {
+        let cfg = Arc::new(Manager::new());
+        let mut tree = ConfigTree::default();
+        tree.games.insert(
+            "Game".into(),
+            Game {
+                path: String::new(),
+                classes: BTreeMap::new(),
+            },
+        );
+        cfg.set_tree(tree);
+
+        add_child(&cfg, &Node::Game("Game".into()), "New Class");
+
+        let tree = cfg.tree();
+        assert!(tree.games["Game"].classes.contains_key("New Class"));
+        assert_eq!(tree.active_game, "Game");
+        assert_eq!(tree.active_class, "New Class");
+        assert!(tree.active_spec.is_empty());
+    }
+
+    #[test]
+    fn context_menu_is_anchored_to_its_row_instead_of_the_list() {
+        if gtk4::init().is_err() {
+            return;
+        }
+
+        let list = gtk4::ListBox::new();
+        let row = gtk4::ListBoxRow::new();
+        list.append(&row);
+        let menu = gtk4::Popover::new();
+
+        anchor_context_menu(&menu, &row);
+
+        assert_eq!(menu.parent().as_ref(), Some(row.upcast_ref()));
+        assert_eq!(list.first_child().as_ref(), Some(row.upcast_ref()));
+        menu.unparent();
+    }
 
     #[test]
     fn adding_a_spec_selects_it_immediately() {
