@@ -17,14 +17,15 @@ use std::sync::Arc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    ApplicationWindow, HeaderBar, Label, Notebook, Orientation, Paned, PolicyType, ScrolledWindow,
+    ApplicationWindow, CssProvider, HeaderBar, Label, Notebook, Orientation, Paned, PolicyType,
+    ScrolledWindow,
 };
 
 use crate::config;
 use crate::engine;
 use crate::ui::buffs_tab::BuffsTab;
 use crate::ui::macros_tab::MacrosTab;
-use crate::ui::overlay::Overlay;
+use crate::ui::overlay::{DmsPalette, Overlay};
 use crate::ui::procs_tab::ProcsTab;
 use crate::ui::settings_tab::SettingsTab;
 use crate::ui::sidebar::Sidebar;
@@ -58,6 +59,40 @@ fn handle_close(
     }
 }
 
+fn install_live_dms_theme(window: &ApplicationWindow) {
+    let provider = CssProvider::new();
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(window),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
+
+    let widget = window.clone().upcast::<gtk4::Widget>();
+    let last_palette = Rc::new(RefCell::new(None::<DmsPalette>));
+    let refresh = {
+        let provider = provider.clone();
+        let widget = widget.clone();
+        let last_palette = last_palette.clone();
+        move || {
+            let Some(palette) = DmsPalette::from_widget(&widget) else {
+                return;
+            };
+            if last_palette.borrow().as_ref() == Some(&palette) {
+                return;
+            }
+            provider.load_from_data(&palette.app_css());
+            *last_palette.borrow_mut() = Some(palette);
+            widget.queue_draw();
+        }
+    };
+
+    refresh();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        refresh();
+        glib::ControlFlow::Continue
+    });
+}
+
 pub struct MainWindow {
     window: ApplicationWindow,
     cfg: Arc<config::Manager>,
@@ -83,6 +118,8 @@ impl MainWindow {
             .default_width(900)
             .default_height(640)
             .build();
+        window.add_css_class("macrotool-window");
+        install_live_dms_theme(&window);
         window.set_size_request(720, 520);
 
         // Header bar — no theme toggle, let the desktop environment handle it

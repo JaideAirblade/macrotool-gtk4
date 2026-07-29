@@ -35,6 +35,105 @@ struct OverlayBuff {
     fraction: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DmsPalette {
+    pub(crate) window: String,
+    pub(crate) window_text: String,
+    pub(crate) highlight: String,
+    pub(crate) highlighted_text: String,
+    pub(crate) mid: String,
+}
+
+impl DmsPalette {
+    fn from_json(source: &str, dark: bool) -> Option<Self> {
+        let mode = if dark { "dark" } else { "light" };
+        let colors: serde_json::Value = serde_json::from_str(source).ok()?;
+        let palette = colors.get("colors")?.get(mode)?;
+        let color = |name: &str| palette.get(name)?.as_str().map(str::to_owned);
+
+        Some(Self {
+            window: color("background")?,
+            window_text: color("on_background")?,
+            highlight: color("primary")?,
+            highlighted_text: color("on_primary")?,
+            mid: color("outline")?,
+        })
+    }
+
+    pub(crate) fn app_css(&self) -> String {
+        format!(
+            r#"
+.macrotool-window,
+.macrotool-window.background,
+.macrotool-window paned,
+.macrotool-window scrolledwindow,
+.macrotool-window viewport,
+.macrotool-window notebook > stack {{
+    background-color: {window};
+    color: {window_text};
+}}
+.macrotool-window headerbar,
+.macrotool-window tabbox {{
+    background-color: {window};
+    color: {window_text};
+}}
+.macrotool-window button,
+.macrotool-window entry,
+.macrotool-window textview,
+.macrotool-window list,
+.macrotool-window row {{
+    color: {window_text};
+    background-color: alpha({window_text}, 0.08);
+}}
+.macrotool-window button:hover,
+.macrotool-window row:hover {{
+    background-color: alpha({highlight}, 0.20);
+}}
+.macrotool-window button.suggested-action,
+.macrotool-window switch:checked,
+.macrotool-window scale highlight,
+.macrotool-window progressbar progress {{
+    color: {highlighted_text};
+    background-color: {highlight};
+}}
+.macrotool-window selection,
+.macrotool-window row:selected {{
+    color: {highlighted_text};
+    background-color: {highlight};
+}}
+.macrotool-window separator {{
+    background-color: alpha({mid}, 0.45);
+}}
+"#,
+            window = self.window,
+            window_text = self.window_text,
+            highlight = self.highlight,
+            highlighted_text = self.highlighted_text,
+            mid = self.mid,
+        )
+    }
+
+    pub(crate) fn from_widget(widget: &gtk4::Widget) -> Option<Self> {
+        let dark = gtk4::Settings::default()
+            .map(|settings| settings.is_gtk_application_prefer_dark_theme())
+            .unwrap_or_else(|| {
+                let color = widget.style_context().color();
+                color.red() + color.green() + color.blue() > 1.5
+            });
+        let path = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".cache/DankMaterialShell/dms-colors.json"))?;
+        Self::from_dms_file(&path, dark)
+    }
+
+    /// Re-open the cache by path on every refresh. DMS publishes palette
+    /// updates through atomic replacement, so retaining an existing file
+    /// handle would otherwise keep Macrotool on the previous theme.
+    fn from_dms_file(path: &Path, dark: bool) -> Option<Self> {
+        Self::from_json(&std::fs::read_to_string(path).ok()?, dark)
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThemePalette {
@@ -340,6 +439,16 @@ fn build_state(
 
 impl ThemePalette {
     fn from_widget(widget: &gtk4::Widget) -> Self {
+        if let Some(dms) = DmsPalette::from_widget(widget) {
+            return Self {
+                window: Some(dms.window),
+                window_text: Some(dms.window_text),
+                highlight: Some(dms.highlight),
+                highlighted_text: Some(dms.highlighted_text),
+                mid: Some(dms.mid),
+            };
+        }
+
         let context = widget.style_context();
         let widget_text = rgba_to_hex(&context.color());
         let pick = |names: &[&str]| {
@@ -462,11 +571,86 @@ fn spawn_qml_overlay(state_path: &Path, qml_path: &Path) -> Result<Child, String
 
 #[cfg(test)]
 mod tests {
-    use super::{secure_runtime_dir, secure_runtime_dir_in, OverlayProcess};
+    use super::{secure_runtime_dir, secure_runtime_dir_in, DmsPalette, OverlayProcess};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn dms_palette_uses_the_active_mode_and_preserves_overlay_contrast() {
+        let palette = DmsPalette::from_json(
+            r##"{
+                "colors": {
+                    "light": {
+                        "background": "#f7f9ff",
+                        "on_background": "#151c24",
+                        "primary": "#006497",
+                        "on_primary": "#ffffff",
+                        "outline": "#717782"
+                    },
+                    "dark": {
+                        "background": "#0c141b",
+                        "on_background": "#dbe3ed",
+                        "primary": "#92ccff",
+                        "on_primary": "#00344f",
+                        "outline": "#8d929a"
+                    }
+                }
+            }"##,
+            true,
+        )
+        .expect("parse DMS palette");
+
+        assert_eq!(palette.window, "#0c141b");
+        assert_eq!(palette.window_text, "#dbe3ed");
+        assert_eq!(palette.highlight, "#92ccff");
+        assert_eq!(palette.highlighted_text, "#00344f");
+        assert_eq!(palette.mid, "#8d929a");
+
+        let css = palette.app_css();
+        assert!(css.contains(".macrotool-window"));
+        assert!(css.contains("background-color: #0c141b"));
+        assert!(css.contains("color: #dbe3ed"));
+        assert!(css.contains("background-color: #92ccff"));
+        assert!(css.contains("color: #00344f"));
+    }
+
+    #[test]
+    fn dms_palette_reopens_the_cache_after_an_atomic_theme_replace() {
+        let directory = tempfile::tempdir().expect("create palette fixture directory");
+        let cache = directory.path().join("dms-colors.json");
+        let initial = r##"{
+            "colors": {
+                "dark": {
+                    "background": "#101010",
+                    "on_background": "#eeeeee",
+                    "primary": "#ff0000",
+                    "on_primary": "#000000",
+                    "outline": "#777777"
+                }
+            }
+        }"##;
+        std::fs::write(&cache, initial).expect("write initial palette");
+        assert_eq!(
+            DmsPalette::from_dms_file(&cache, true)
+                .expect("read initial palette")
+                .highlight,
+            "#ff0000"
+        );
+
+        let replacement = directory.path().join("dms-colors.next.json");
+        let updated = initial.replace("#ff0000", "#00ff00");
+        std::fs::write(&replacement, updated).expect("write replacement palette");
+        std::fs::rename(&replacement, &cache).expect("atomically publish replacement palette");
+
+        assert_eq!(
+            DmsPalette::from_dms_file(&cache, true)
+                .expect("read replacement palette")
+                .highlight,
+            "#00ff00"
+        );
+    }
 
     #[test]
     fn qml_overlay_prefers_gtk_colors_with_a_system_palette_fallback() {
