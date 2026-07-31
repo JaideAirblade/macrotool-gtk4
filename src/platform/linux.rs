@@ -342,6 +342,25 @@ fn device_reader_loop(mut dev: evdev::Device, _path: PathBuf, is_primary: bool) 
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EventRoute {
+    Keyboard,
+    Mouse,
+    Passthrough,
+}
+
+fn grabbed_event_route(is_primary: bool, is_mouse: bool) -> EventRoute {
+    if is_primary {
+        if is_mouse {
+            EventRoute::Mouse
+        } else {
+            EventRoute::Keyboard
+        }
+    } else {
+        EventRoute::Passthrough
+    }
+}
+
 fn handle_linux_event(ev: evdev::InputEvent, is_primary: bool, grabbed: bool) {
     match ev.destructure() {
         evdev::EventSummary::Key(_, key, value) => {
@@ -370,26 +389,25 @@ fn handle_linux_event(ev: evdev::InputEvent, is_primary: bool, grabbed: bool) {
 
             let key_name = vk_to_name(code);
 
-            // Shadow keyboard (grabbed but not primary): re-emit every key
-            // without calling the callback. This prevents the key from leaking
-            // to the compositor through an ungrabbed device node, without
-            // double-firing the hotkey callback.
-            if !is_primary {
-                send_linux_key(code, !down);
-                return;
-            }
-
-            // Primary keyboard: call the hotkey callback, suppress if needed.
             if key_name.is_empty() {
                 send_linux_key(code, !down);
                 return;
             }
 
             let is_mouse = is_mouse_key(&key_name);
-            let cb = if is_mouse {
-                None
-            } else {
-                KB_HOOK_CB.lock().clone()
+            // Shadow keyboards re-emit events without invoking callbacks to
+            // avoid duplicate hotkey transitions. The primary hybrid keyboard
+            // may also carry mouse buttons, which must use the mouse callback
+            // rather than being silently treated as ordinary keyboard input.
+            if grabbed_event_route(is_primary, is_mouse) == EventRoute::Passthrough {
+                send_linux_key(code, !down);
+                return;
+            }
+
+            let cb = match grabbed_event_route(is_primary, is_mouse) {
+                EventRoute::Mouse => MS_HOOK_CB.lock().clone(),
+                EventRoute::Keyboard => KB_HOOK_CB.lock().clone(),
+                EventRoute::Passthrough => None,
             };
 
             let suppress = match cb {
@@ -953,4 +971,14 @@ pub struct RECT {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grabbed_event_route, EventRoute};
+
+    #[test]
+    fn hybrid_primary_mouse_button_uses_mouse_route() {
+        assert_eq!(grabbed_event_route(true, true), EventRoute::Mouse);
+    }
 }
