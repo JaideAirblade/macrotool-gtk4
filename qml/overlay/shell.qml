@@ -26,15 +26,14 @@ ShellRoot {
     readonly property string statePath: Quickshell.env("MACROTOOL_OVERLAY_STATE") || ""
 
     function updateGameTagVisibility(source) {
-        gameVisibleOnActiveTag = false;
         try {
             const clients = JSON.parse(source).clients || [];
             const gamePid = Number(root.state.gamePid || 0);
             gameVisibleOnActiveTag = gamePid > 0 && clients.some(client =>
                 Number(client.pid) === gamePid && client.is_visible === true);
         } catch (error) {
-            // Treat an unavailable compositor IPC response as not visible so
-            // the global layer surface cannot leak onto another tag.
+            // Keep the last confirmed state while an IPC request is in flight.
+            // Clearing it before every successful reply caused visible flicker.
         }
     }
 

@@ -687,6 +687,12 @@ mod tests {
     }
 
     #[test]
+    fn qml_overlay_visibility_probe_does_not_clear_a_known_visible_game_before_its_next_reply() {
+        let qml = include_str!("../../qml/overlay/shell.qml");
+        assert!(!qml.contains("gameVisibleOnActiveTag = false;\n        try"));
+    }
+
+    #[test]
     fn qml_overlay_profile_header_contributes_its_full_natural_width() {
         let qml = include_str!("../../qml/overlay/shell.qml");
         assert!(qml.contains("id: profileHeader"));
