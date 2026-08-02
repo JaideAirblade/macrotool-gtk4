@@ -156,6 +156,7 @@ struct OverlayState {
     buffs: Vec<OverlayBuff>,
     game_active: bool,
     game_alive: bool,
+    game_pid: u32,
     overlay_position: String,
     theme: ThemePalette,
 }
@@ -432,6 +433,7 @@ fn build_state(
         buffs,
         game_active: engine.detector.is_active(cfg),
         game_alive: engine.detector.is_game_alive(),
+        game_pid: engine.detector.game_pid(),
         overlay_position: cfg.settings().overlay_position,
         theme: ThemePalette::from_widget(theme_widget),
     }
@@ -673,6 +675,15 @@ mod tests {
         assert!(qml.contains("top-right"));
         assert!(qml.contains("bottom-left"));
         assert!(qml.contains("bottom-right"));
+    }
+
+    #[test]
+    fn qml_overlay_only_maps_when_the_game_client_is_visible_on_an_active_tag() {
+        let qml = include_str!("../../qml/overlay/shell.qml");
+        assert!(qml.contains("property bool gameVisibleOnActiveTag"));
+        assert!(qml.contains("command: [\"mmsg\", \"get\", \"all-clients\"]"));
+        assert!(qml.contains("root.state.gamePid"));
+        assert!(qml.contains("&& root.gameVisibleOnActiveTag"));
     }
 
     #[test]

@@ -16,10 +16,43 @@ ShellRoot {
         buffs: [],
         gameActive: false,
         gameAlive: false,
+        gamePid: 0,
         overlayPosition: "top-left"
     })
     property bool stateLoaded: false
+    // Layer-shell surfaces are global in Mango, so only map this one while
+    // the tracked game client itself is visible on the currently active tag.
+    property bool gameVisibleOnActiveTag: false
     readonly property string statePath: Quickshell.env("MACROTOOL_OVERLAY_STATE") || ""
+
+    function updateGameTagVisibility(source) {
+        gameVisibleOnActiveTag = false;
+        try {
+            const clients = JSON.parse(source).clients || [];
+            const gamePid = Number(root.state.gamePid || 0);
+            gameVisibleOnActiveTag = gamePid > 0 && clients.some(client =>
+                Number(client.pid) === gamePid && client.is_visible === true);
+        } catch (error) {
+            // Treat an unavailable compositor IPC response as not visible so
+            // the global layer surface cannot leak onto another tag.
+        }
+    }
+
+    Process {
+        id: gameClientProbe
+        command: ["mmsg", "get", "all-clients"]
+        running: true
+        stdout: StdioCollector {
+            onStreamFinished: root.updateGameTagVisibility(this.text)
+        }
+    }
+
+    Timer {
+        interval: 250
+        running: true
+        repeat: true
+        onTriggered: gameClientProbe.running = true
+    }
 
     function readState() {
         if (!stateFile.loaded)
@@ -83,7 +116,7 @@ ShellRoot {
 
     PanelWindow {
         id: overlayWindow
-        visible: root.stateLoaded && root.overlayPosition !== "hidden"
+        visible: root.stateLoaded && root.overlayPosition !== "hidden" && root.gameVisibleOnActiveTag
         implicitWidth: card.implicitWidth
         implicitHeight: card.implicitHeight
         color: "transparent"
