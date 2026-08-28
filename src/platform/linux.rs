@@ -618,7 +618,24 @@ fn handle_linux_event(ev: evdev::InputEvent, is_primary: bool, grabbed: bool) {
                 log::debug!("[linux] SUPPRESSED key={} code={} down={}", key_name, code, down);
             }
 
-            if !suppress {
+            // Re-emit policy for grabbed devices:
+            //   - Keyboard-key presses are owned by the macro when
+            //     suppressed (correct — no double-fire).
+            //   - Keyboard-key releases: do NOT re-emit. The press was
+            //     suppressed, so the OS has no matching down; re-emitting
+            //     an unmatched release confuses the kernel/Wayland stack.
+            //   - Mouse-button presses: suppressed when the macro owns
+            //     them (correct).
+            //   - Mouse-button releases: ALWAYS re-emit, even when
+            //     suppressed. Without this, holding a mouse-button hotkey
+            //     (Rbutton, xbutton1/2) and releasing it leaves the OS
+            //     thinking the button is still down forever — the desktop
+            //     and any app polling the physical button state see a
+            //     stuck button. The macro's uinput-injected key sequence
+            //     is independent of this path, so the release doesn't
+            //     leak the hotkey into the game.
+            let must_emit_release = !down && is_mouse;
+            if !suppress || must_emit_release {
                 send_linux_key(code, !down);
             }
         }
@@ -665,30 +682,52 @@ pub fn current_process_id() -> u32 {
 }
 
 pub fn get_foreground_window() -> WindowHandle {
-    // Try the compositor's native focus API first. Niri exposes focus state
-    // over a Unix socket (`niri msg -j focused-window`) which works without
-    // an X server — critical under pure-Wayland sessions where X11 lookup
-    // below would silently return None and the suppression gate would fall
-    // back to "game alive" (causing macros to fire on the desktop).
-    if let Some(pid) = niri_foreground_pid() {
-        FOCUSED_PID.store(pid, Ordering::Release);
-        return WindowHandle(pid as u64);
-    }
-    // X11 fallback for XWayland sessions (GDK_BACKEND=x11). Most wlroots
-    // compositors populate _NET_ACTIVE_WINDOW, so this is the right tool for
-    // Sway/Hyprland-on-XWayland setups.
-    if let Some(pid) = x11_foreground_pid() {
-        FOCUSED_PID.store(pid, Ordering::Release);
-        return WindowHandle(pid as u64);
-    }
-    // Neither source could determine focus. Return an invalid handle so
-    // callers can detect "unknown" and refuse to fire. The historical
-    // fallback (`FOCUSED_PID.load`) returned stale data — under Niri with
-    // no X server, that meant the suppression gate never closed and macros
-    // leaked into other apps.
-    FOCUSED_PID.store(0, Ordering::Release);
-    WindowHandle(0)
+    // Hot path: atomic load of the cached foreground PID. The cache is
+    // refreshed by `refresh_foreground_cache()` below, which the game
+    // detector calls every 150ms. Reading the cache is ~nanoseconds, so
+    // the per-key-event cost in `should_suppress_hotkey` is negligible.
+    // Without this, the previous implementation spawned a `niri msg`
+    // subprocess on every keypress, which pegged CPU and tanked game
+    // framerate (100+ fork+exec per second on a held movement key).
+    let cached = CACHED_FOCUSED_PID.load(Ordering::Acquire);
+    WindowHandle(cached as u64)
 }
+
+/// Refresh the cached foreground PID by polling Niri (preferred) and X11
+/// (fallback). Intended to be called from a low-frequency poll thread — the
+/// game detector calls it every 150ms. A slow Niri IPC round-trip here does
+/// NOT block the input hot path.
+pub fn refresh_foreground_cache() {
+    // Niri path first — it's the dominant case on the user's UwU host
+    // and the only one that works on pure-Wayland sessions.
+    if let Some(pid) = niri_foreground_pid() {
+        if pid != CACHED_FOCUSED_PID.load(Ordering::Acquire) {
+            log::debug!("[linux] focus -> {} (niri)", pid);
+        }
+        CACHED_FOCUSED_PID.store(pid, Ordering::Release);
+        return;
+    }
+    // X11 fallback for XWayland sessions (GDK_BACKEND=x11).
+    if let Some(pid) = x11_foreground_pid() {
+        if pid != CACHED_FOCUSED_PID.load(Ordering::Acquire) {
+            log::debug!("[linux] focus -> {} (x11)", pid);
+        }
+        CACHED_FOCUSED_PID.store(pid, Ordering::Release);
+        return;
+    }
+    // Neither source reachable. Set the cache to 0 so the suppression
+    // gate's "unknown focus → deny" branch fires. We don't keep the
+    // previous value — a stale PID was the original Niri bug.
+    let prev = CACHED_FOCUSED_PID.swap(0, Ordering::AcqRel);
+    if prev != 0 {
+        log::debug!("[linux] focus -> 0 (unknown)");
+    }
+}
+
+/// Cached foreground window PID (0 = unknown / no source). Updated by
+/// `refresh_foreground_cache()` and read by `get_foreground_window() at
+/// every key event. Atomic load makes the hot path lock-free.
+static CACHED_FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Resolve the focused window PID via Niri's IPC socket.
 ///
@@ -699,16 +738,19 @@ pub fn get_foreground_window() -> WindowHandle {
 ///
 /// Important: returns `None` (not a stale PID) on any failure so the caller
 /// can fail-closed rather than fire macros into the wrong window.
+///
+/// EXPENSIVE: forks a process. Call from a poll thread (the game detector
+/// polls every 150ms), NOT from the key-event hot path.
 fn niri_foreground_pid() -> Option<u32> {
     let socket = niri_socket_path()?;
     if !socket.exists() {
         return None;
     }
 
-    // Synchronous run — this is called from the game-detector poll thread
-    // every 150ms, so we MUST time-bound it. If Niri hangs (e.g. compositing
-    // stall), we want the detector to skip this tick and rely on the next
-    // one, not block forever.
+    // Synchronous run — called from the game-detector poll thread every
+    // 150ms, NOT from the key-event hot path. If Niri hangs (e.g.
+    // compositing stall), we want the detector to skip this tick and rely
+    // on the next one, not block the input pipeline.
     let output = Command::new("niri")
         .args(["msg", "-j", "focused-window"])
         .env("NIRI_SOCKET", &socket)
@@ -1203,8 +1245,6 @@ pub fn set_macro_thread_affinity() {
 }
 
 // ── Global hooks ─────────────────────────────────────────────────────────
-
-static FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_keyboard_hook(callback: HookCallback) -> Result<HookHandle, String> {
     *KB_HOOK_CB.lock() = Some(callback);

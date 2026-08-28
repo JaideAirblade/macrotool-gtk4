@@ -144,6 +144,13 @@ impl GameDetector {
 
     /// Check the foreground window against configured game path.
     pub fn check_window(&self, cfg: &config::Manager) {
+        // Refresh the foreground-PID cache once per detector tick. The
+        // hot path (suppression gate, macro send) only reads the cache,
+        // so polling cost is bounded here. Without this refresh the cache
+        // would be frozen at 0 forever and the gate would deny every
+        // macro press.
+        platform::refresh_foreground_cache();
+
         let active_game = cfg.active_game();
         let game_path = cfg.game_path(&active_game).unwrap_or_default();
 
