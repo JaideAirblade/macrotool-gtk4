@@ -1032,11 +1032,68 @@ pub fn query_process_path(pid: u32) -> Option<String> {
         }
     }
 
+    // Special case for xwayland-satellite under Niri: Wine/Proton X11 apps
+    // are fronted by an xwayland-satellite instance whose own cmdline has
+    // no useful info, but whose child tree contains the actual game loader
+    // (wine-preloader / proton / wine64) — and that child has the Windows
+    // exe path in its cmdline. Walk the child tree to find it. This is the
+    // bridge that lets the detector match under Niri + Heroic/Wine/Proton.
+    if let Some(p) = query_child_wine_path(pid) {
+        return Some(p);
+    }
+
     // Absolute last resort: return the exe path even if it's not .exe.
     if let Ok(p) = std::fs::read_link(&exe_path) {
         return Some(p.to_string_lossy().to_string());
     }
     None
+}
+
+/// If `pid` is (or hosts) a Wine/Proton game process, return the Windows
+/// exe path found in that process's cmdline. Used to identify the real game
+/// under Niri's xwayland-satellite wrapper.
+///
+/// Walks one level of children looking for processes whose cmdline contains
+/// a Windows-style path ending in `.exe`. Recursion is intentionally one
+/// level deep — Wine launchers are direct children of xwayland-satellite,
+/// and deeper walks add latency on every 150ms detector tick.
+fn query_child_wine_path(pid: u32) -> Option<String> {
+    let children = read_child_pids(pid)?;
+    for child in children {
+        let cmd_path = PathBuf::from(format!("/proc/{}/cmdline", child));
+        if let Ok(data) = std::fs::read(&cmd_path) {
+            if let Some(path) = process_path_from_cmdline(&data) {
+                if path.to_lowercase().ends_with(".exe") {
+                    return Some(path);
+                }
+            }
+        }
+        // Also try the child's exe in case the cmdline doesn't have the
+        // Windows path (some Proton variants).
+        let child_exe = PathBuf::from(format!("/proc/{}/exe", child));
+        if let Ok(p) = std::fs::read_link(&child_exe) {
+            let s = p.to_string_lossy().to_string();
+            if s.to_lowercase().ends_with(".exe") {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Read /proc/<pid>/task/<tid>/children to enumerate direct children.
+/// Returns PIDs (as u32).
+fn read_child_pids(pid: u32) -> Option<Vec<u32>> {
+    // The first task's children file lists all direct children.
+    let path = PathBuf::from(format!("/proc/{}/task/{}/children", pid, pid));
+    let data = std::fs::read_to_string(&path).ok()?;
+    let mut out = Vec::new();
+    for tok in data.split_whitespace() {
+        if let Ok(p) = tok.parse::<u32>() {
+            out.push(p);
+        }
+    }
+    Some(out)
 }
 
 pub fn is_process_alive(pid: u32) -> bool {
