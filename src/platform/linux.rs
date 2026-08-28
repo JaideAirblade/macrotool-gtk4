@@ -338,6 +338,25 @@ fn is_mouse_device(dev: &evdev::Device) -> bool {
     ev.contains(evdev::EventType::RELATIVE) || ev.contains(evdev::EventType::ABSOLUTE)
 }
 
+fn is_virtual_device(dev: &evdev::Device, dev_file: &str) -> bool {
+    // Name-based check (cheap, catches most uinput tools).
+    let name = dev.name().unwrap_or_default().to_string();
+    if name.contains("Macrotool")
+        || name.to_lowercase().contains("virtual")
+        || name.to_lowercase().contains("uinput")
+    {
+        return true;
+    }
+    // Kernel-accurate check: uinput-created devices live under
+    // /sys/devices/virtual/input/. Reading them is pointless (they only
+    // carry events another tool injected, which the compositor already
+    // receives) and grabbing one would wedge real input.
+    if let Ok(link) = std::fs::read_link(format!("/sys/class/input/{}", dev_file)) {
+        return link.to_string_lossy().contains("/devices/virtual/");
+    }
+    false
+}
+
 fn open_input_devices() -> Vec<(evdev::Device, PathBuf)> {
     let mut out = Vec::new();
     let dir = Path::new("/dev/input");
@@ -347,11 +366,18 @@ fn open_input_devices() -> Vec<(evdev::Device, PathBuf)> {
             let s = name.to_string_lossy();
             if s.starts_with("event") {
                 if let Ok(dev) = evdev::Device::open(entry.path()) {
-                    // Skip our own uinput virtual device — reading it back would
-                    // create a feedback loop (we inject → we read → we re-inject).
-                    let dev_name = dev.name().unwrap_or_default().to_string();
-                    if dev_name.contains("Macrotool") || dev_name.contains("Virtual Input") {
-                        log::debug!("[linux] skipping own virtual device: {} ({})", s, dev_name);
+                    // Skip virtual (uinput-created) devices — our own, plus
+                    // ydotoold and friends. Reading them back would create a
+                    // feedback loop (we inject → we read → we re-inject), and
+                    // a virtual device must never become the primary
+                    // keyboard: it never emits events, so keyboard hotkeys
+                    // routed to it would silently never trigger.
+                    if is_virtual_device(&dev, &s) {
+                        log::debug!(
+                            "[linux] skipping virtual device: {} ({})",
+                            s,
+                            dev.name().unwrap_or_default()
+                        );
                         continue;
                     }
                     out.push((dev, entry.path()));
