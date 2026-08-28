@@ -650,6 +650,21 @@ where
     f(WindowHandle(pid as u64));
 }
 
+fn process_path_from_cmdline(data: &[u8]) -> Option<String> {
+    let args: Vec<&[u8]> = data.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+
+    // Wine/Proton commonly puts its loader in argv[0] and the Windows game
+    // executable in a later argument. Prefer that executable when present.
+    args.iter()
+        .map(|arg| String::from_utf8_lossy(arg))
+        .find(|arg| arg.to_lowercase().ends_with(".exe"))
+        .map(|arg| arg.into_owned())
+        .or_else(|| {
+            args.first()
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        })
+}
+
 pub fn query_process_path(pid: u32) -> Option<String> {
     // For native Linux apps, /proc/{pid}/exe is the real binary.
     // For Wine/Proton games, /proc/{pid}/exe points to the wine64 binary
@@ -674,17 +689,8 @@ pub fn query_process_path(pid: u32) -> Option<String> {
     if let Ok(data) = std::fs::read(&cmd) {
         // cmdline is null-separated. The first arg is usually the executable
         // path. For Wine it's often "Z:\path\to\Client.exe".
-        let args: Vec<&[u8]> = data.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
-        if let Some(first) = args.first() {
-            let s = String::from_utf8_lossy(first).to_string();
-            return Some(s);
-        }
-        // Some Wine versions put the path in a later arg; scan all args.
-        for arg in &args {
-            let s = String::from_utf8_lossy(arg);
-            if s.to_lowercase().ends_with(".exe") {
-                return Some(s.to_string());
-            }
+        if let Some(path) = process_path_from_cmdline(&data) {
+            return Some(path);
         }
     }
 
@@ -975,10 +981,19 @@ pub struct RECT {
 
 #[cfg(test)]
 mod tests {
-    use super::{grabbed_event_route, EventRoute};
+    use super::{grabbed_event_route, process_path_from_cmdline, EventRoute};
 
     #[test]
     fn hybrid_primary_mouse_button_uses_mouse_route() {
         assert_eq!(grabbed_event_route(true, true), EventRoute::Mouse);
+    }
+
+    #[test]
+    fn wine_cmdline_prefers_the_game_executable_over_the_loader() {
+        let cmdline = b"/nix/store/wine64-preloader\0Z:\\Games\\SEBNS\\Client.exe\0--flag\0";
+        assert_eq!(
+            process_path_from_cmdline(cmdline).as_deref(),
+            Some("Z:\\Games\\SEBNS\\Client.exe")
+        );
     }
 }

@@ -297,11 +297,50 @@ struct ManagerInner {
     config_file: PathBuf,
     backup_file: PathBuf,
     save_deadline: Option<Instant>,
+    persistence_blocked: bool,
 }
 
 // SAFETY: ManagerInner is behind RwLock, so Manager is Send + Sync.
 unsafe impl Send for ManagerInner {}
 unsafe impl Sync for ManagerInner {}
+
+fn create_default_config(path: &std::path::Path, default_text: &str) -> Result<bool, String> {
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(format!("create default config failed: {error}")),
+    };
+
+    if let Err(error) = std::io::Write::write_all(&mut file, default_text.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        return Err(format!("write default config failed: {error}"));
+    }
+    Ok(true)
+}
+
+fn read_config_or_initialize(
+    path: &std::path::Path,
+    default_text: &str,
+) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(data) => Ok(Some(data)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if create_default_config(path, default_text)? {
+                Ok(None)
+            } else {
+                std::fs::read_to_string(path)
+                    .map(Some)
+                    .map_err(|error| format!("read concurrently created config failed: {error}"))
+            }
+        }
+        Err(error) => Err(format!("read config failed: {error}")),
+    }
+}
 
 impl Manager {
     pub fn new() -> Self {
@@ -315,6 +354,7 @@ impl Manager {
             config_file,
             backup_file,
             save_deadline: None,
+            persistence_blocked: false,
         };
 
         Manager {
@@ -334,35 +374,37 @@ impl Manager {
 
     /// Load config from disk. Falls back to defaults if file is missing.
     pub fn load(&self) -> Result<(), String> {
-        let mut inner = self.inner.write();
-        inner.tree = ConfigTree::default();
+        let result = (|| {
+            let mut inner = self.inner.write();
+            inner.tree = ConfigTree::default();
 
-        std::fs::create_dir_all(&inner.config_dir).map_err(|e| format!("mkdir failed: {}", e))?;
+            std::fs::create_dir_all(&inner.config_dir)
+                .map_err(|e| format!("mkdir failed: {}", e))?;
 
-        let data = match std::fs::read_to_string(&inner.config_file) {
-            Ok(d) => d,
-            Err(_) => {
-                // No config file — write defaults and return
-                let doc = build_doc(&inner.tree);
-                let _ = std::fs::write(&inner.config_file, kdl_mod::dump(&doc));
-                return Ok(());
-            }
-        };
+            let default_text = kdl_mod::dump(&build_doc(&inner.tree));
+            let data = match read_config_or_initialize(&inner.config_file, &default_text)? {
+                Some(data) => data,
+                None => return Ok(()),
+            };
 
-        let doc = match kdl_mod::parse(&data) {
-            Ok(d) => d,
-            Err(_) => {
-                // Try backup
-                match std::fs::read_to_string(&inner.backup_file) {
-                    Ok(backup) => kdl_mod::parse(&backup).map_err(|e| e)?,
-                    Err(_) => return Err("config parse failed and no backup".into()),
+            let doc = match kdl_mod::parse(&data) {
+                Ok(d) => d,
+                Err(_) => {
+                    // Try backup
+                    match std::fs::read_to_string(&inner.backup_file) {
+                        Ok(backup) => kdl_mod::parse(&backup).map_err(|e| e)?,
+                        Err(_) => return Err("config parse failed and no backup".into()),
+                    }
                 }
-            }
-        };
+            };
 
-        parse_doc(&doc, &mut inner.tree);
-        validate(&mut inner.tree);
-        Ok(())
+            parse_doc(&doc, &mut inner.tree);
+            validate(&mut inner.tree);
+            Ok(())
+        })();
+
+        self.inner.write().persistence_blocked = result.is_err();
+        result
     }
 
     /// Debounced save — schedules a save 300ms in the future.
@@ -395,6 +437,9 @@ impl Manager {
 
     fn save_now(&self) -> Result<(), String> {
         let inner = self.inner.read();
+        if inner.persistence_blocked {
+            return Err("config persistence blocked after load failure".into());
+        }
         let doc = build_doc(&inner.tree);
         let text = kdl_mod::dump(&doc);
 
@@ -1000,5 +1045,60 @@ fn normalize_overlay_position(position: &str) -> String {
             position.to_string()
         }
         _ => default_overlay_position(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager_in(config_dir: &std::path::Path) -> Manager {
+        Manager {
+            inner: Arc::new(RwLock::new(ManagerInner {
+                tree: ConfigTree::default(),
+                config_dir: config_dir.to_path_buf(),
+                config_file: config_dir.join("config.kdl"),
+                backup_file: config_dir.join("config.kdl.bak"),
+                save_deadline: None,
+                persistence_blocked: false,
+            })),
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_config_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("config fixture directory");
+        let path = dir.path().join("config.kdl");
+        let invalid = b"settings {\n  broken=\xff\n}\n";
+        std::fs::write(&path, invalid).expect("write invalid config fixture");
+
+        let result = read_config_or_initialize(&path, "replacement defaults");
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).expect("read preserved config"), invalid);
+    }
+
+    #[test]
+    fn malformed_config_blocks_shutdown_flush_and_preserves_original() {
+        let dir = tempfile::tempdir().expect("config fixture directory");
+        let path = dir.path().join("config.kdl");
+        let malformed = b"settings {\n  defaultDelay=\n";
+        std::fs::write(&path, malformed).expect("write malformed config fixture");
+        let manager = manager_in(dir.path());
+
+        assert!(manager.load().is_err());
+        assert!(manager.flush().is_err());
+        assert_eq!(std::fs::read(path).expect("read preserved config"), malformed);
+    }
+
+    #[test]
+    fn atomic_default_creation_never_overwrites_a_concurrent_winner() {
+        let dir = tempfile::tempdir().expect("config fixture directory");
+        let path = dir.path().join("config.kdl");
+        let winner = b"settings defaultDelay=42\n";
+        std::fs::write(&path, winner).expect("publish concurrent config");
+
+        assert!(!create_default_config(&path, "replacement defaults").expect("create result"));
+        assert_eq!(std::fs::read(path).expect("read winning config"), winner);
     }
 }

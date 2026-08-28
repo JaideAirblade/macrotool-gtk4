@@ -121,7 +121,7 @@ impl BuffEngine {
             let final_duration = if on_refresh == "extend" {
                 let elapsed = existing.start.elapsed();
                 let remaining = existing.duration.saturating_sub(elapsed);
-                remaining + Duration::from_millis(buff.extend_ms as u64)
+                remaining + Duration::from_millis(buff.extend_ms.max(0) as u64)
             } else {
                 new_duration
             };
@@ -394,6 +394,22 @@ mod tests {
             queued.action,
             ExpiryAction::FireActionKey { play_sound: true }
         );
+        engine.stop();
+    }
+
+    #[test]
+    fn negative_buff_extension_does_not_wrap_to_an_enormous_duration() {
+        let engine = BuffEngine::new();
+        let mut buff = BuffTimer::default();
+        buff.name = "Refreshable".into();
+        buff.duration = 60_000;
+        engine.activate(buff.clone());
+
+        buff.on_refresh = "extend".into();
+        buff.extend_ms = -1;
+        engine.activate(buff);
+
+        assert!(engine.get_active_timers()["Refreshable"] <= 60_000.0);
         engine.stop();
     }
 }

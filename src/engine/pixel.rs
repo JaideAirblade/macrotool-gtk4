@@ -71,6 +71,10 @@ impl PixelEngine {
     }
 }
 
+fn requires_screen_capture(triggers: &[PixelTrigger]) -> bool {
+    !triggers.is_empty()
+}
+
 fn poll_loop(
     triggers: Arc<Mutex<Vec<PixelTrigger>>>,
     stop: Arc<AtomicBool>,
@@ -93,6 +97,10 @@ fn poll_loop(
             .unwrap_or(250)
             .clamp(10, 1000);
         let triggers = triggers.lock().clone();
+        if !requires_screen_capture(&triggers) {
+            thread::sleep(Duration::from_millis(rate as u64));
+            continue;
+        }
 
         let (cur_w, cur_h) = platform::get_screen_resolution();
         let now = Instant::now();
@@ -264,4 +272,16 @@ fn is_game_foreground(game_pid: u32) -> bool {
     let fg = platform::get_foreground_window();
     let (_, fg_pid) = platform::get_window_thread_process_id(fg);
     fg_pid == game_pid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requires_screen_capture;
+    use crate::config::PixelTrigger;
+
+    #[test]
+    fn empty_trigger_list_does_not_capture_the_screen() {
+        let triggers: Vec<PixelTrigger> = Vec::new();
+        assert!(!requires_screen_capture(&triggers));
+    }
 }

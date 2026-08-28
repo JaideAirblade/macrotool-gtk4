@@ -475,6 +475,14 @@ fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
     false
 }
 
+fn should_consume_hotkey_event(
+    is_down: bool,
+    hotkey: &HotkeyInfo,
+    transition: Transition,
+) -> bool {
+    transition != Transition::None || (is_down && hotkey.is_active())
+}
+
 /// Returns true if the event was consumed (suppressed), false if it should
 /// pass through to the OS. Only registered, enabled hotkeys that pass the
 /// suppression gate are consumed; everything else passes through.
@@ -533,6 +541,24 @@ fn handle_hotkey_key(state: &HookSharedState, key_name: &str, is_down: bool) -> 
         transition
     );
     state.dispatch(&key_name, transition);
-    // Suppress the key only when we actually dispatched a transition
-    transition != Transition::None
+    // Initial presses/releases dispatch a transition. Kernel autorepeat emits
+    // another key-down while the hotkey is already active; consume that event
+    // too so the physical hotkey cannot leak back into the game.
+    should_consume_hotkey_event(is_down, &hk, transition)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_consume_hotkey_event, HotkeyInfo, HotkeyMode, Transition};
+
+    #[test]
+    fn active_macro_hotkey_suppresses_key_repeat_without_redispatching() {
+        let hotkey = HotkeyInfo::new(HotkeyMode::Press);
+        assert_eq!(hotkey.on_key_down(), Transition::Start);
+
+        let repeat = hotkey.on_key_down();
+
+        assert_eq!(repeat, Transition::None);
+        assert!(should_consume_hotkey_event(true, &hotkey, repeat));
+    }
 }

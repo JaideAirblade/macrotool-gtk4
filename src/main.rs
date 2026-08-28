@@ -15,6 +15,21 @@ use std::sync::Arc;
 
 const APP_ID: &str = "com.jaide.macrotool";
 
+/// Prefer GTK's OpenGL renderer on systems where the default Vulkan renderer
+/// can terminate the entire process on a fatal driver error. Respect an
+/// explicit user override for diagnostics or future renderer improvements.
+fn renderer_fallback(current: Option<&std::ffi::OsStr>) -> Option<&'static std::ffi::OsStr> {
+    current
+        .is_none()
+        .then_some(std::ffi::OsStr::new("gl"))
+}
+
+fn install_renderer_fallback() {
+    if let Some(renderer) = renderer_fallback(std::env::var_os("GSK_RENDERER").as_deref()) {
+        std::env::set_var("GSK_RENDERER", renderer);
+    }
+}
+
 /// Theme-aware UI styling. GTK4 app CSS cannot reference @theme_* variables
 /// (GTK3/libadwaita-only — the parser warns and drops them), so everything
 /// derives from `currentColor`, which the theme sets on each widget. This
@@ -84,6 +99,7 @@ notebook > header > tabs > tab:hover {
 ";
 
 fn main() {
+    install_renderer_fallback();
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
 
@@ -267,4 +283,16 @@ fn install_live_accent_css(widget: &gtk4::Widget) {
         update();
         glib::ControlFlow::Continue
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renderer_fallback;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn defaults_to_gl_renderer_without_overriding_user_choice() {
+        assert_eq!(renderer_fallback(None), Some(OsStr::new("gl")));
+        assert_eq!(renderer_fallback(Some(OsStr::new("vulkan"))), None);
+    }
 }
