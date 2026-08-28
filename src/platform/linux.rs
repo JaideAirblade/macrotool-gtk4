@@ -15,7 +15,7 @@
 use super::{HookCallback, HookHandle, WindowHandle, MOUSE_KEY_NAMES};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -216,6 +216,16 @@ fn emit_rel(dev: &mut evdev::uinput::VirtualDevice, axis: u16, value: i32) {
 }
 
 fn send_linux_key(code: u16, up: bool) {
+    // Track what the virtual device holds down so stuck keys can always be
+    // released later (device death, macro abort, pause, shutdown).
+    {
+        let mut injected = INJECTED_DOWN.lock();
+        if up {
+            injected.remove(&code);
+        } else {
+            injected.insert(code);
+        }
+    }
     let mut guard = UINPUT.lock();
     if let Some(ref mut d) = *guard {
         let value = if up { 0 } else { 1 };
@@ -248,7 +258,59 @@ static KB_HOOK_CB: Lazy<Mutex<Option<HookCallback>>> = Lazy::new(|| Mutex::new(N
 static MS_HOOK_CB: Lazy<Mutex<Option<HookCallback>>> = Lazy::new(|| Mutex::new(None));
 
 static HOOK_STOP: AtomicBool = AtomicBool::new(false);
-static HOOK_THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// True while any registered macro hotkey is a keyboard (non-mouse) key.
+/// When false, keyboard devices are read passively for state tracking only
+/// and NEVER grabbed — physical typing cannot get stuck inside macrotool's
+/// re-emit pipeline because macrotool is not in the path at all.
+static KEY_GRAB_NEEDED: AtomicBool = AtomicBool::new(false);
+
+/// Codes the virtual device currently holds down (injected, not yet released).
+static INJECTED_DOWN: Lazy<Mutex<HashSet<u16>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// evdev device paths that have a live reader thread.
+static ACTIVE_DEVICES: Lazy<Mutex<HashSet<PathBuf>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Path of the device that owns the keyboard hotkey callback.
+static PRIMARY_KB_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// How long an injected tap is held down. A down/up pair microseconds apart
+/// is missed or mis-latched by games that poll key state once per frame.
+const TAP_HOLD: Duration = Duration::from_millis(10);
+
+/// Reconfigure whether keyboards must be grabbed (a profile with keyboard
+/// hotkeys needs grabbing; a mouse-only profile must not touch keyboards).
+pub fn set_keyboard_grab_needed(needed: bool) {
+    let changed = KEY_GRAB_NEEDED.swap(needed, Ordering::AcqRel) != needed;
+    if changed {
+        log::info!("[linux] keyboard grab needed = {}", needed);
+    }
+}
+
+/// Release every key the virtual device still holds down. Idempotent.
+pub fn release_all_injected() {
+    let codes: Vec<u16> = INJECTED_DOWN.lock().drain().collect();
+    if codes.is_empty() {
+        return;
+    }
+    log::warn!("[linux] releasing {} stuck injected key(s)", codes.len());
+    let mut guard = UINPUT.lock();
+    if let Some(ref mut d) = *guard {
+        for code in codes {
+            emit_key(d, code, 0);
+        }
+    }
+}
+
+/// Release a single key by engine name (no-op for unknown names).
+pub fn release_key(key: &str) {
+    let code = name_to_vk(key);
+    if code != 0 {
+        send_linux_key(code, true);
+    }
+}
 
 static CURSOR_X: AtomicI32 = AtomicI32::new(0);
 static CURSOR_Y: AtomicI32 = AtomicI32::new(0);
@@ -300,45 +362,153 @@ fn open_input_devices() -> Vec<(evdev::Device, PathBuf)> {
     out
 }
 
-fn device_reader_loop(mut dev: evdev::Device, _path: PathBuf, is_primary: bool) {
-    // is_primary=true: this is the primary keyboard. Grab it, call the hotkey
-    //   callback, suppress trigger keys when the game is focused, re-emit
-    //   everything else via uinput.
-    // is_primary=false: this is a shadow keyboard OR a mouse device.
-    //   - Shadow keyboards: grab + re-emit every key (no callback, no
-    //     suppression) — prevents the key leaking to the compositor through
-    //     an ungrabbed device node while avoiding double-firing macros.
-    //   - Mice: read without grabbing (state tracking only).
+fn device_reader_loop(mut dev: evdev::Device, path: PathBuf, is_primary: bool) {
+    let dev_name = dev.name().unwrap_or_default().to_string();
     let is_keyboard = is_keyboard_device(&dev);
-    let grab = is_keyboard; // grab all keyboards, never mice
-    let grabbed = if grab {
-        let r = dev.grab();
-        if r.is_err() {
-            log::warn!("[linux] failed to grab device — events may leak");
-        }
-        r.is_ok()
-    } else {
-        false
-    };
+    log::info!(
+        "[linux] reader start {} ({}) primary={} keyboard={}",
+        path.display(),
+        dev_name,
+        is_primary,
+        is_keyboard
+    );
+    ACTIVE_DEVICES.lock().insert(path.clone());
+    if is_primary {
+        *PRIMARY_KB_PATH.lock() = Some(path.clone());
+    }
+
+    // is_primary=true: this device owns the hotkey callback. The device may
+    // be a hybrid (keyboard with mouse buttons) — key events route to
+    // Keyboard, mouse-button events route to Mouse.
+    // is_primary=false: shadow keyboard or plain mouse.
+    //   - Shadow keyboards: re-emit every key (no callback) while
+    //     KEY_GRAB_NEEDED is set; otherwise passive state tracking only.
+    //   - Mice: never grabbed; mouse-button events still fire the mouse
+    //     callback (that is how rbutton / xbutton2 macros trigger).
+    let mut consecutive_errors = 0u32;
+    let mut grabbed = false;
+    // Keys this device currently holds down (per-device, so a dying device
+    // only synthesizes release events for keys IT reported).
+    let mut local_held: HashSet<u16> = HashSet::new();
+
     loop {
         if HOOK_STOP.load(Ordering::Acquire) {
             break;
         }
-        match dev.fetch_events() {
-            Ok(it) => {
-                for ev in it {
-                    handle_linux_event(ev, is_primary, grabbed);
+
+        // Grab state follows KEY_GRAB_NEEDED live, so a mouse-only profile
+        // never intercepts physical typing and a profile edit that adds a
+        // keyboard hotkey starts grabbing without a restart.
+        let want_grab = is_keyboard && KEY_GRAB_NEEDED.load(Ordering::Acquire);
+        if want_grab != grabbed {
+            let r = if want_grab { dev.grab() } else { dev.ungrab() };
+            match r {
+                Ok(()) => {
+                    grabbed = want_grab;
+                    log::info!(
+                        "[linux] {} {} ({})",
+                        if want_grab { "grabbed" } else { "ungrabbed" },
+                        path.display(),
+                        dev_name
+                    );
                 }
-            }
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    thread::sleep(Duration::from_millis(1));
+                Err(e) => {
+                    log::warn!(
+                        "[linux] grab toggle failed on {}: {} — will retry",
+                        path.display(),
+                        e
+                    );
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         }
+
+        match dev.fetch_events() {
+            Ok(it) => {
+                consecutive_errors = 0;
+                for ev in it {
+                    if let evdev::EventSummary::Key(_, key, value) = ev.destructure() {
+                        let code = key.code() as u16;
+                        if value != 0 {
+                            local_held.insert(code);
+                        } else {
+                            local_held.remove(&code);
+                        }
+                    }
+                    handle_linux_event(ev, is_primary, grabbed);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Idle poll on a non-blocking fd — nothing to do.
+            }
+            Err(e) => {
+                // ENODEV = device unplugged / re-enumerated. Bail out now;
+                // the exit cleanup synthesizes the missing key-ups.
+                if e.raw_os_error() == Some(libc::ENODEV) {
+                    log::warn!(
+                        "[linux] device {} detached (ENODEV)",
+                        path.display()
+                    );
+                    break;
+                }
+                consecutive_errors += 1;
+                if consecutive_errors == 1 {
+                    log::warn!("[linux] read error on {}: {}", path.display(), e);
+                }
+                if consecutive_errors >= 50 {
+                    log::error!(
+                        "[linux] reader for {} failed {}x — exiting thread",
+                        path.display(),
+                        consecutive_errors
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // Device vanished from /dev/input (unplug / dongle re-enumeration).
+        if !path.exists() {
+            log::warn!("[linux] device {} disappeared", path.display());
+            break;
+        }
     }
+
+    // ── Thread exit cleanup ────────────────────────────────────────────
+    // The device is gone or wedged. While grabbed, its key-ups can never
+    // arrive through us, so synthesize them: fire the hook callbacks with
+    // is_down=false (updates the hotkey state machine + physical_down so
+    // hold macros stop cleanly) and release everything the virtual device
+    // still holds. This is the anti-stuck-key safety net.
     if grabbed {
+        let downs: Vec<(u16, String)> = local_held
+            .iter()
+            .filter_map(|code| CODE_TO_NAME.get(code).map(|n| (*code, n.clone())))
+            .collect();
+        for (_, name) in &downs {
+            let cb = if is_mouse_key(name) {
+                MS_HOOK_CB.lock().clone()
+            } else {
+                KB_HOOK_CB.lock().clone()
+            };
+            if let Some(cb) = cb {
+                let _ = cb(name, false);
+            }
+        }
+        if !downs.is_empty() {
+            log::warn!(
+                "[linux] synthesized key-up for {} key(s) after {} died",
+                downs.len(),
+                path.display()
+            );
+        }
+        release_all_injected();
+        KEY_STATE.lock().clear();
         let _ = dev.ungrab();
+    }
+    ACTIVE_DEVICES.lock().remove(&path);
+    if is_primary {
+        *PRIMARY_KB_PATH.lock() = None;
     }
 }
 
@@ -374,9 +544,12 @@ fn handle_linux_event(ev: evdev::InputEvent, is_primary: bool, grabbed: bool) {
                 ls.insert(code, !cur);
             }
 
-            // Not grabbed (mouse) — call the mouse callback for hotkey
-            // detection, but we can't suppress (the compositor already has it).
-            // Track state and return.
+            // Ungrabbed: events flow to the compositor directly, so we can
+            // never suppress — but we still observe them. Mouse buttons fire
+            // the mouse callback (that's how rbutton/xbutton2 hotkeys work;
+            // mice are never grabbed). Keyboard keys on an ungrabbed keyboard
+            // are pure state tracking (mouse-only profile: macrotool must not
+            // be in the typing path at all).
             if !grabbed {
                 let key_name = vk_to_name(code);
                 if !key_name.is_empty() && is_mouse_key(&key_name) {
@@ -710,7 +883,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 pub fn send_key(key: &str) {
     if is_mouse_key(key) {
         send_mouse(key, false);
-        std::thread::yield_now();
+        thread::sleep(TAP_HOLD);
         send_mouse(key, true);
         return;
     }
@@ -720,7 +893,9 @@ pub fn send_key(key: &str) {
         return;
     }
     send_linux_key(code, false);
-    std::thread::yield_now();
+    // Hold the tap long enough for games that poll key state once per
+    // frame — a near-zero hold is missed or mis-latched by some engines.
+    thread::sleep(TAP_HOLD);
     send_linux_key(code, true);
 }
 
@@ -876,8 +1051,22 @@ fn decode_png(data: &[u8]) -> Option<(i32, i32, Vec<u32>)> {
 pub fn precise_sleep(ms: f64) {
     let start = Instant::now();
     let target = Duration::from_secs_f64(ms / 1000.0);
-    while start.elapsed() < target {
-        std::hint::spin_loop();
+    // Hybrid sleep: spin only for the last 2ms (accuracy), sleep before that
+    // (CPU friendly). The old pure spin loop burned a full core per hold
+    // macro and stole CPU from the evdev reader threads — a starved reader
+    // re-emits key-down but misses key-up, which is how keys get stuck.
+    let spin_threshold = Duration::from_millis(2);
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= target {
+            break;
+        }
+        let remaining = target - elapsed;
+        if remaining > spin_threshold {
+            thread::sleep(remaining - spin_threshold);
+        } else {
+            std::hint::spin_loop();
+        }
     }
 }
 
@@ -905,7 +1094,46 @@ pub fn set_mouse_hook(callback: HookCallback) -> Result<HookHandle, String> {
 }
 
 pub fn unhook(_hook: HookHandle) {
-    HOOK_STOP.store(true, Ordering::Release);
+    // Individual hook teardown is driven by run_hook_message_loop's stop
+    // channel; nothing to do per-hook here.
+}
+
+/// Spawn reader threads for every currently-connected keyboard/mouse that
+/// isn't already being read. First keyboard found becomes the primary (owns
+/// the hotkey callback); later keyboards are shadows (re-emit only).
+/// Returns the handles and whether a primary keyboard was seen.
+fn spawn_device_readers() -> (Vec<std::thread::JoinHandle<()>>, bool) {
+    let mut handles = Vec::new();
+    let mut primary_keyboard_seen = false;
+    let already_active = ACTIVE_DEVICES.lock().clone();
+
+    for (dev, path) in open_input_devices() {
+        let is_kb = is_keyboard_device(&dev);
+        let is_mouse = is_mouse_device(&dev);
+        if !is_kb && !is_mouse {
+            continue;
+        }
+        if already_active.contains(&path) {
+            continue; // reader thread already running for this node
+        }
+        let is_primary = is_kb && !primary_keyboard_seen;
+        if is_primary {
+            primary_keyboard_seen = true;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        match thread::Builder::new()
+            .name(format!("evdev-{}", name))
+            .spawn(move || device_reader_loop(dev, path, is_primary))
+        {
+            Ok(h) => handles.push(h),
+            Err(e) => log::warn!("[linux] spawn reader for {} failed: {}", name, e),
+        }
+    }
+    (handles, primary_keyboard_seen)
 }
 
 pub fn run_hook_message_loop(_stop_rx: crossbeam_channel::Receiver<()>) -> Result<(), String> {
@@ -919,8 +1147,6 @@ pub fn run_hook_message_loop(_stop_rx: crossbeam_channel::Receiver<()>) -> Resul
     // Make sure virtual device is fully registered before we start grabbing.
     std::thread::sleep(Duration::from_millis(100));
 
-    let devices = open_input_devices();
-
     // A single physical keyboard often exposes MULTIPLE evdev device nodes
     // (e.g. "SCYROX Xpunk 63 Keyboard" on event9/10/11/13 + the 8K dongle on
     // event14-22). If we grab only ONE, the keypress leaks to the compositor
@@ -929,42 +1155,52 @@ pub fn run_hook_message_loop(_stop_rx: crossbeam_channel::Receiver<()>) -> Resul
     // second sees Transition::None (suppress=false) and re-emits — breaking
     // suppression and causing hold macros to stop instantly.
     //
-    // Fix: grab ALL keyboard devices. The FIRST keyboard we find is the
-    // "primary" — it owns the hotkey callback. All other keyboards are
-    // "shadow" devices: they grab + re-emit every key (no callback, always
-    // pass through), preventing key leakage without double-firing macros.
-    // Mouse devices are never grabbed.
-    let mut primary_keyboard_seen = false;
+    // Strategy: read ALL keyboard + mouse nodes. The FIRST keyboard is the
+    // "primary" — it owns the hotkey callback. Other keyboards are "shadow"
+    // devices. Keyboards are only actually GRABBED while KEY_GRAB_NEEDED is
+    // set (some registered hotkey is a keyboard key); with a mouse-only
+    // profile macrotool never touches physical typing at all. Mice are never
+    // grabbed.
+    let (mut handles, primary_seen) = spawn_device_readers();
+    if !primary_seen {
+        log::warn!("[linux] no keyboard device found — keyboard hotkeys disabled");
+    }
 
-    let mut handles = Vec::new();
-    for (dev, path) in devices {
-        let is_kb = is_keyboard_device(&dev);
-        let is_mouse = is_mouse_device(&dev);
-        if is_kb || is_mouse {
-            let is_primary = is_kb && !primary_keyboard_seen;
-            if is_primary {
-                primary_keyboard_seen = true;
+    // Watch for device hotplug: 8K mice/keyboards re-enumerate their nodes
+    // (event14-22 → event23+), leaving the old reader threads reading a dead
+    // fd. Rescan every 2s and spawn readers for new nodes.
+    let watcher_handles = thread::Builder::new()
+        .name("evdev-rescan".into())
+        .spawn(|| {
+            loop {
+                thread::sleep(Duration::from_secs(2));
+                if HOOK_STOP.load(Ordering::Acquire) {
+                    break;
+                }
+                let (new_handles, _) = spawn_device_readers();
+                for h in new_handles {
+                    // Detached: HOOK_STOP is the shutdown signal for all
+                    // reader threads including these.
+                    std::mem::forget(h);
+                }
             }
-            let _name = path.file_name().unwrap_or_default().to_string_lossy();
-            let handle = thread::Builder::new()
-                .name(format!("evdev-{}", _name))
-                .spawn(move || device_reader_loop(dev, path, is_primary))
-                .map_err(|e| format!("spawn evdev reader: {}", e))?;
-            handles.push(handle);
-        }
-    }
-    if !primary_keyboard_seen {
-        log::warn!("[linux] no keyboard device grabbed — suppression will not work");
-    }
-    *HOOK_THREADS.lock() = handles;
+        });
 
-    // Wait until stopped, then join all device threads.
+    // Wait until stopped.
     let _ = _stop_rx.recv();
     HOOK_STOP.store(true, Ordering::Release);
-    let handles: Vec<_> = HOOK_THREADS.lock().drain(..).collect();
-    for h in handles {
+    if let Ok(h) = watcher_handles {
         let _ = h.join();
     }
+
+    // Detach reader threads instead of joining them: they sit in blocking
+    // fetch_events() and would only notice HOOK_STOP after their next event,
+    // making app shutdown hang until the user touches a key. EVIOCGRAB is
+    // released by the kernel when the process exits, so detaching is safe.
+    std::mem::forget(handles);
+
+    // Final safety net: never leave injected keys down at shutdown.
+    release_all_injected();
 
     Ok(())
 }

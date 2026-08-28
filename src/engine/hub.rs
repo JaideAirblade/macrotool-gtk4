@@ -135,6 +135,10 @@ impl EngineHub {
                             log::warn!("[hub] EMERGENCY STOP via toggle-key loop");
                             enabled_flag.store(false, Ordering::Release);
                             macros_toggle.set_paused(true);
+                            // Kill wedged hotkey states and release anything
+                            // the virtual device still holds down.
+                            input_for_toggle.reset_all_states();
+                            platform::release_all_injected();
                         }
                         // Don't process the toggle key while emergency-stopping
                         continue;
@@ -158,7 +162,18 @@ impl EngineHub {
                             was_down = state;
                             let old = enabled_flag.load(Ordering::Acquire);
                             enabled_flag.store(!old, Ordering::Release);
-                            macros_toggle.set_paused(!old);
+                            // paused must be the INVERSE of the new enabled
+                            // state. This used to be set_paused(!old) which
+                            // set paused == enabled — fully inverted: toggling
+                            // macros "on" paused them, and after an emergency
+                            // stop ScrollLock could never un-pause.
+                            macros_toggle.set_paused(old);
+                            if old {
+                                // Just disabled: clear wedged hotkey states
+                                // and release any stuck injected keys.
+                                input_for_toggle.reset_all_states();
+                                platform::release_all_injected();
+                            }
                             log::info!("[hub] toggle key {} → macros {}", key, !old);
                         }
                     } else {
@@ -167,7 +182,11 @@ impl EngineHub {
                             was_down = true;
                             let old = enabled_flag.load(Ordering::Acquire);
                             enabled_flag.store(!old, Ordering::Release);
-                            macros_toggle.set_paused(!old);
+                            macros_toggle.set_paused(old);
+                            if old {
+                                input_for_toggle.reset_all_states();
+                                platform::release_all_injected();
+                            }
                             log::info!("[hub] toggle key {} → macros {}", key, !old);
                         } else if !down {
                             was_down = false;

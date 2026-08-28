@@ -525,31 +525,54 @@ fn handle_hotkey_key(state: &HookSharedState, key_name: &str, is_down: bool) -> 
         return false; // hotkey disabled — pass through
     }
 
-    if !should_suppress_hotkey(state, &hk) {
-        return false; // gate says don't suppress — pass through
-    }
-
+    // ── Anti-wedge: releases must ALWAYS advance the state machine ──
+    // The suppression gate decides whether the physical event is eaten,
+    // NOT whether the hotkey state machine runs. If we skipped on_key_up
+    // whenever the gate closed (focus flicker, game exit, pause), the FSM
+    // stayed stuck in Pressed/Holding forever and the next press looked
+    // like autorepeat (Transition::None) — the macro could never trigger
+    // again until the game restarted.
     let transition = if is_down {
         hk.on_key_down()
     } else {
         hk.on_key_up()
     };
+
+    let gate_open = should_suppress_hotkey(state, &hk);
+
+    // A press while the gate is closed belongs to the desktop, not the
+    // game: revert the FSM so nothing wedges and never START a macro from
+    // a desktop press (keys would be injected into the focused app).
+    if !gate_open && matches!(transition, Transition::Start | Transition::Toggle) {
+        hk.set_state(HotkeyState::Idle);
+        return false;
+    }
+
     log::debug!(
-        "[input] hotkey {} down={} transition={:?}",
+        "[input] hotkey {} down={} transition={:?} gate={}",
         key_name,
         is_down,
-        transition
+        transition,
+        gate_open
     );
     state.dispatch(&key_name, transition);
-    // Initial presses/releases dispatch a transition. Kernel autorepeat emits
-    // another key-down while the hotkey is already active; consume that event
-    // too so the physical hotkey cannot leak back into the game.
+
+    // Gate open → the event belongs to us: consume it (and any autorepeat
+    // while active) so the physical hotkey cannot leak into the game.
+    // Gate closed → pass the physical event through untouched.
+    if !gate_open {
+        return false;
+    }
     should_consume_hotkey_event(is_down, &hk, transition)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{should_consume_hotkey_event, HotkeyInfo, HotkeyMode, Transition};
+    use super::{
+        handle_hotkey_key, should_consume_hotkey_event, HookSharedState, HotkeyInfo, HotkeyMode,
+        Transition,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn active_macro_hotkey_suppresses_key_repeat_without_redispatching() {
@@ -560,5 +583,53 @@ mod tests {
 
         assert_eq!(repeat, Transition::None);
         assert!(should_consume_hotkey_event(true, &hotkey, repeat));
+    }
+
+    fn armed_state() -> HookSharedState {
+        let state = HookSharedState::new();
+        state.hotkeys.lock().insert(
+            "rbutton".to_string(),
+            Arc::new(HotkeyInfo::new(HotkeyMode::Hold)),
+        );
+        state.engine_active.store(true, std::sync::atomic::Ordering::Release);
+        state.game_pid.store(42, std::sync::atomic::Ordering::Release);
+        state.game_alive.store(true, std::sync::atomic::Ordering::Release);
+        state
+    }
+
+    #[test]
+    fn release_while_gate_closed_still_advances_state_machine() {
+        let state = armed_state();
+
+        // Gate open (game alive): press is consumed and activates the hotkey.
+        assert!(handle_hotkey_key(&state, "rbutton", true));
+        assert!(state.hotkeys.lock()["rbutton"].is_active());
+
+        // Gate closes between press and release (focus lost / game exited).
+        state.game_alive.store(false, std::sync::atomic::Ordering::Release);
+
+        // The release PASSES THROUGH (gate closed, not our event anymore)…
+        assert!(!handle_hotkey_key(&state, "rbutton", false));
+        // …but the state machine still advanced to Idle — no wedge.
+        assert!(!state.hotkeys.lock()["rbutton"].is_active());
+
+        // Next press with the gate open starts cleanly instead of being
+        // swallowed as "autorepeat" — the old bug made this impossible.
+        state.game_alive.store(true, std::sync::atomic::Ordering::Release);
+        assert!(handle_hotkey_key(&state, "rbutton", true));
+        assert!(state.hotkeys.lock()["rbutton"].is_active());
+    }
+
+    #[test]
+    fn press_while_gate_closed_does_not_start_a_macro() {
+        let state = armed_state();
+        // Gate closed: user is on the desktop, press belongs to the desktop.
+        state.game_alive.store(false, std::sync::atomic::Ordering::Release);
+
+        assert!(!handle_hotkey_key(&state, "rbutton", true));
+        assert!(
+            !state.hotkeys.lock()["rbutton"].is_active(),
+            "desktop press must not arm the hotkey"
+        );
     }
 }

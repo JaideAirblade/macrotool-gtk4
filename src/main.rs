@@ -15,6 +15,19 @@ use std::sync::Arc;
 
 const APP_ID: &str = "com.jaide.macrotool";
 
+struct StderrLogger(log::LevelFilter);
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.0
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 /// Prefer GTK's OpenGL renderer on systems where the default Vulkan renderer
 /// can terminate the entire process on a fatal driver error. Respect an
 /// explicit user override for diagnostics or future renderer improvements.
@@ -100,6 +113,20 @@ notebook > header > tabs > tab:hover {
 
 fn main() {
     install_renderer_fallback();
+    // Opt-in diagnostics: MACROTOOL_LOG=info (or debug) logs hotkey
+    // transitions, grab toggles, device hotplug and stuck-key sweeps to
+    // stderr. Off by default — game machines don't want log spam.
+    if std::env::var_os("MACROTOOL_LOG").is_some() {
+        let level = std::env::var("MACROTOOL_LOG").unwrap_or_default();
+        let lv = match level.as_str() {
+            "debug" | "trace" => log::LevelFilter::Debug,
+            "warn" => log::LevelFilter::Warn,
+            "error" => log::LevelFilter::Error,
+            _ => log::LevelFilter::Info,
+        };
+        let _ = log::set_logger(Box::leak(Box::new(StderrLogger(lv))));
+        log::set_max_level(lv);
+    }
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
 

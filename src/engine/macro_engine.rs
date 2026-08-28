@@ -85,6 +85,15 @@ impl MacroEngine {
         let mut profile = self.profile.lock();
         let mut running = self.running.lock();
 
+        // Do any registered hotkeys use keyboard keys? If every hotkey is a
+        // mouse button (rbutton/xbutton2/...), keyboards must NOT be grabbed:
+        // macrotool then stays completely out of the physical typing path and
+        // cannot stick movement keys like a/s/w.
+        let kb_needed = macros
+            .iter()
+            .any(|m| !m.hotkey.is_empty() && !platform::is_mouse_key(&m.hotkey));
+        platform::set_keyboard_grab_needed(kb_needed);
+
         for m in macros {
             let hk = m.hotkey.to_lowercase();
             if hk.is_empty() {
@@ -288,6 +297,13 @@ fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHan
     // Always clear the running flag when the loop exits so any
     // callers see a consistent stopped state.
     stop_flag.store(false, Ordering::Release);
+
+    // Safety net: if the loop exited between an injected key-down and its
+    // key-up (stop requested mid-sequence), release every key this macro
+    // could still hold down. release_key is idempotent.
+    for key in &keys {
+        platform::release_key(key);
+    }
 }
 
 /// Send a sequence of keys using the correct delivery strategy:
