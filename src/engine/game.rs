@@ -184,10 +184,28 @@ impl GameDetector {
 
         // Check foreground process path
         let proc_path = platform::query_process_path(fg_pid);
-        let matched = proc_path
+        let mut matched = proc_path
             .as_ref()
             .map(|p| paths_match(&game_path, p))
             .unwrap_or(false);
+
+        // Niri + Heroic/Wine/Proton fallback: when the foreground PID is
+        // xwayland-satellite, its own /proc cmdline has nothing useful
+        // (X clients connect via socket, not fork). Walk every /proc entry
+        // looking for a process whose cmdline ends in the configured
+        // Windows .exe. If we find one, treat the foreground window as
+        // the game — the user has the game focused, just via the
+        // satellite wrapper.
+        if !matched {
+            if let Some(wine_path) = scan_wine_process_for_game(&game_path) {
+                log::debug!(
+                    "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {}",
+                    fg_pid,
+                    wine_path
+                );
+                matched = true;
+            }
+        }
 
         if matched {
             self.game_pid.store(fg_pid, Ordering::Release);
@@ -266,7 +284,7 @@ impl GameDetector {
 
 /// Compare two file paths case-insensitively. On Wine/Proton the X11
 /// window PID points to the wine process, whose cmdline has a Windows-style
-/// path (Z:\...\Client.exe) that differs from the configured Linux path
+/// path (Z:\...\\Client.exe) that differs from the configured Linux path
 /// (/home/.../Client.exe). So we compare both the full path AND just the
 /// filename (last path component), which is the most reliable signal.
 fn paths_match(configured: &str, actual: &str) -> bool {
@@ -285,4 +303,64 @@ fn paths_match(configured: &str, actual: &str) -> bool {
     let c_file = c.rsplit('/').next().unwrap_or(&c);
     let a_file = a.rsplit('/').next().unwrap_or(&a);
     !c_file.is_empty() && c_file == a_file
+}
+
+/// Scan every /proc entry looking for a Wine/Proton game process whose
+/// cmdline ends in the configured Windows .exe. Used as a fallback when
+/// the foreground window's own /proc lookup doesn't yield a useful path
+/// (e.g. Niri's xwayland-satellite wrapper, where X clients connect via
+/// Unix socket rather than forking from the satellite).
+///
+/// Returns the cmdline path of the matching process, or None if no Wine
+/// process carrying the configured exe name is running.
+///
+/// Cost: one readdir on /proc per 150ms detector tick (~few hundred
+/// entries, ~1ms total). Acceptable for a low-frequency poll thread.
+fn scan_wine_process_for_game(configured: &str) -> Option<String> {
+    let configured_basename = std::path::Path::new(configured)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if configured_basename.is_empty() {
+        return None;
+    }
+
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if !s.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match s.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Never the game if it's us.
+        if pid == platform::current_process_id() {
+            continue;
+        }
+        let cmd_path = std::path::PathBuf::from(format!("/proc/{}/cmdline", pid));
+        let data = match std::fs::read(&cmd_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // cmdline is null-separated args. Take the first arg.
+        let first_arg = data
+            .split(|&b| b == 0)
+            .find(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).to_string());
+        let path = match first_arg {
+            Some(p) => p,
+            None => continue,
+        };
+        let basename = std::path::Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if basename == configured_basename {
+            return Some(path);
+        }
+    }
+    None
 }
