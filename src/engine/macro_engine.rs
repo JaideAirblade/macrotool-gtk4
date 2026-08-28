@@ -346,24 +346,23 @@ fn send_key_sequence(
                 log::debug!("[macro] background key {} dropped, no hwnd", key);
             }
         } else {
-            // Non-background macro: inject via uinput only if game is foreground.
-            // But tolerate brief focus flickers — if the game is alive, send
-            // anyway. The game detector polls every 150ms and the game can
-            // flicker out of focus for a single tick; dropping the key on
-            // every flicker makes the macro unusable.
+            // Non-background macro: inject via uinput only if the game is
+            // CURRENTLY the focused window. We previously OR'd `game_alive`
+            // here to tolerate 150ms focus flickers, but that fallback also
+            // matched "game running in the background, user is in browser"
+            // and injected keys into the wrong app. The detector re-checks
+            // focus every 150ms, so dropping on a single tick is acceptable;
+            // any real focused game frame will pick the key up on the next
+            // tick (the macro holds the hotkey, so the next press retries).
             let game_foreground = is_game_foreground(game_pid);
-            let game_alive = handle.detector.is_game_alive();
-            log::debug!(
-                "[macro] foreground key {} game_foreground={} game_alive={}",
-                key,
-                game_foreground,
-                game_alive
-            );
-            if game_foreground || game_alive {
+            log::debug!("[macro] foreground key {} game_foreground={}", key, game_foreground);
+            if game_foreground {
                 log::debug!("[macro] sending foreground key {} direct", key);
                 platform::send_key(key);
             }
-            // else: game not alive at all — drop the key
+            // else: focus is unknown, or some other app is focused — drop
+            // the key. We never inject into a window we can't positively
+            // identify as the game.
         }
 
         // Activate buff timers for this key
@@ -386,13 +385,21 @@ fn check_buffs(cfg: &config::Manager, buffs: &crate::engine::buff::BuffEngine, k
 }
 
 /// Check if the game process is the current foreground window.
+///
+/// "Unknown" focus (returns PID 0 from the platform layer, e.g. when no
+/// compositor IPC is reachable) is treated as NOT foreground. The old
+/// implementation OR'd `game_alive` here, which caused macros to inject
+/// into whichever app actually had focus whenever the game was running
+/// but the user wasn't in it. Pair with the matching fix in `input.rs`.
 pub(crate) fn is_game_foreground(game_pid: u32) -> bool {
     if game_pid == 0 {
         return false;
     }
     let fg = platform::get_foreground_window();
     let (_, fg_pid) = platform::get_window_thread_process_id(fg);
-    fg_pid == game_pid
+    // Strict match: require a positive foreground-PID that equals the
+    // game's PID. Unknown focus → false → caller drops the key.
+    fg_pid != 0 && fg_pid == game_pid
 }
 
 #[cfg(test)]

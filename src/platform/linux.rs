@@ -665,16 +665,113 @@ pub fn current_process_id() -> u32 {
 }
 
 pub fn get_foreground_window() -> WindowHandle {
-    // Query X11 for the real foreground window. This works under XWayland
-    // (GDK_BACKEND=x11) which is how the app runs on Wayland. The compositor's
-    // shell reads the same _NET_ACTIVE_WINDOW property, so this is the same
-    // info the DM shell has.
+    // Try the compositor's native focus API first. Niri exposes focus state
+    // over a Unix socket (`niri msg -j focused-window`) which works without
+    // an X server — critical under pure-Wayland sessions where X11 lookup
+    // below would silently return None and the suppression gate would fall
+    // back to "game alive" (causing macros to fire on the desktop).
+    if let Some(pid) = niri_foreground_pid() {
+        FOCUSED_PID.store(pid, Ordering::Release);
+        return WindowHandle(pid as u64);
+    }
+    // X11 fallback for XWayland sessions (GDK_BACKEND=x11). Most wlroots
+    // compositors populate _NET_ACTIVE_WINDOW, so this is the right tool for
+    // Sway/Hyprland-on-XWayland setups.
     if let Some(pid) = x11_foreground_pid() {
         FOCUSED_PID.store(pid, Ordering::Release);
         return WindowHandle(pid as u64);
     }
-    // Fallback: last known focused PID (may be 0 on first run).
-    WindowHandle(FOCUSED_PID.load(Ordering::Acquire) as u64)
+    // Neither source could determine focus. Return an invalid handle so
+    // callers can detect "unknown" and refuse to fire. The historical
+    // fallback (`FOCUSED_PID.load`) returned stale data — under Niri with
+    // no X server, that meant the suppression gate never closed and macros
+    // leaked into other apps.
+    FOCUSED_PID.store(0, Ordering::Release);
+    WindowHandle(0)
+}
+
+/// Resolve the focused window PID via Niri's IPC socket.
+///
+/// Niri stores its socket at `${NIRI_SOCKET:-/run/user/<uid>/niri.wayland-1.<pid>.sock}`.
+/// We shell out to `niri msg -j focused-window` and parse the JSON
+/// `{"pid": <u32>, ...}` field. Returns `None` if Niri isn't running, the
+/// socket isn't reachable, the command fails, or no window is focused.
+///
+/// Important: returns `None` (not a stale PID) on any failure so the caller
+/// can fail-closed rather than fire macros into the wrong window.
+fn niri_foreground_pid() -> Option<u32> {
+    let socket = niri_socket_path()?;
+    if !socket.exists() {
+        return None;
+    }
+
+    // Synchronous run — this is called from the game-detector poll thread
+    // every 150ms, so we MUST time-bound it. If Niri hangs (e.g. compositing
+    // stall), we want the detector to skip this tick and rely on the next
+    // one, not block forever.
+    let output = Command::new("niri")
+        .args(["msg", "-j", "focused-window"])
+        .env("NIRI_SOCKET", &socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?
+        .wait_with_output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return None,
+    };
+
+    if !output.status.success() {
+        // "No window is focused" is the normal idle case — quiet debug log,
+        // no warning noise.
+        log::trace!(
+            "[linux] niri msg -j focused-window failed: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return None;
+    }
+
+    let json = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            log::debug!("[linux] niri focused-window JSON parse failed: {}", e);
+            return None;
+        }
+    };
+
+    json.get("pid")
+        .and_then(|p| p.as_u64())
+        .filter(|&p| p != 0)
+        .map(|p| p as u32)
+}
+
+/// Locate the Niri IPC socket. Honour `$NIRI_SOCKET` first (set by the
+/// compositor when launching child processes), then fall back to scanning
+/// `/run/user/<uid>/` for a `niri.wayland-1.*.sock` file.
+fn niri_socket_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("NIRI_SOCKET") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    // Best-effort scan of /run/user/$UID/. We don't fail loudly if the
+    // directory isn't readable (different UID, sandbox); the caller will
+    // simply not detect Niri and move on to X11.
+    let uid = unsafe { libc::getuid() };
+    let dir = PathBuf::from(format!("/run/user/{}", uid));
+    let entries = std::fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with("niri.wayland-1.") && s.ends_with(".sock") {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 /// Query X11 _NET_ACTIVE_WINDOW → _NET_WM_PID to find the PID of the

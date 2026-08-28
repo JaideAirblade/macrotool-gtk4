@@ -417,16 +417,28 @@ fn hook_thread_fn(
 /// Decide whether the physical key/button event should be eaten and forwarded
 /// to the macro engine.
 ///
-/// Suppression logic:
-/// 1. Must not be paused, engine must be active, game PID must be set.
-/// 2. If our own window is foreground → don't suppress (user is configuring).
-/// 3. If the game window is foreground → suppress (hotkey is for the game).
-/// 4. If the game is alive but not foreground:
-///    - For background macros → suppress (they fire via global uinput injection).
-///    - For non-background macros → don't suppress (user is on another app,
-///      we shouldn't eat their keypress). The macro engine's send path will
-///      also drop the key if the game isn't foreground, so suppressing here
-///      would just waste the input.
+/// Suppression logic (fail-closed — when in doubt, pass the key through):
+/// 1. Paused or engine inactive → don't suppress.
+/// 2. No game PID configured → don't suppress.
+/// 3. Our own window is foreground → don't suppress (user is configuring).
+/// 4. The game window is foreground → suppress.
+/// 5. Some other app is foreground → don't suppress (the user is somewhere
+///    else; eating their keypress is the bug we are guarding against).
+/// 6. Foreground is UNKNOWN (PID 0 — Niri IPC down, X11 unavailable,
+///    no compositor API) → don't suppress. Macros stay silent rather than
+///    fire into the wrong window. The per-macro `background` flag remains
+///    the explicit opt-in for cross-app behaviour.
+// ── Test-only focus injection ───────────────────────────────────────────
+//
+// The suppression gate normally calls `platform::get_foreground_window()` to
+// ask the OS which window is focused. Under unit tests there is no real
+// compositor, so the platform returns PID 0 (unknown). To exercise the
+// gate without mocking the platform, tests can stash a synthetic PID into
+// `TEST_FOCUSED_PID` (non-zero) before calling `handle_hotkey_key`, and
+// zero it again afterwards.
+#[cfg(test)]
+static TEST_FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
+
 fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
     if state.paused.load(Ordering::Acquire) {
         return false;
@@ -440,38 +452,54 @@ fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
         return false;
     }
 
-    let fg = platform::get_foreground_window();
-    let (_, fg_pid) = platform::get_window_thread_process_id(fg);
+    let (fg_pid, own_pid): (u32, u32) = {
+        #[cfg(test)]
+        {
+            let injected = TEST_FOCUSED_PID.load(Ordering::Acquire);
+            if injected != 0 {
+                (injected, state.own_pid)
+            } else {
+                let fg = platform::get_foreground_window();
+                let (_, p) = platform::get_window_thread_process_id(fg);
+                (p, state.own_pid)
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let fg = platform::get_foreground_window();
+            let (_, p) = platform::get_window_thread_process_id(fg);
+            (p, state.own_pid)
+        }
+    };
 
-    // Our own window foreground → don't suppress
-    if fg_pid == state.own_pid && fg_pid != 0 {
+    // Our own window foreground → don't suppress (user is configuring).
+    // Skip this when fg_pid == 0 — the comparator might be returning its
+    // own process ID for a moment, and we don't want that to override the
+    // "unknown focus" deny below.
+    if fg_pid != 0 && fg_pid == own_pid {
         return false;
     }
 
-    // Game is foreground → suppress
+    // Game is foreground → suppress.
     if fg_pid == game_pid {
         return true;
     }
 
-    // On Wayland we often cannot detect the foreground window (fg_pid == 0).
-    // In that case, fall back to "game alive = suppress allowed" so macros
-    // still fire. Without this, the suppression gate is permanently closed
-    // on Wayland and no macro ever fires.
-    if fg_pid == 0 {
-        let game_alive = state.game_alive.load(Ordering::Acquire);
-        return game_alive;
+    // Focus is known and is not the game → never suppress. The user is
+    // somewhere else (browser, terminal, Discord) and we must not eat
+    // their keypresses.
+    if fg_pid != 0 {
+        return false;
     }
 
-    // Game is alive but not foreground.
-    // Background macros: suppress (they inject globally via uinput).
-    // Non-background macros: don't suppress (user is on another app,
-    //   eating their keypress would just block them for no benefit —
-    //   the send path drops the key when the game isn't foreground).
-    let game_alive = state.game_alive.load(Ordering::Acquire);
-    if game_alive && hk.is_background() {
-        return true;
-    }
-
+    // Focus UNKNOWN (fg_pid == 0): fail CLOSED. The historical fallback
+    // returned `game_alive` here, which silently leaked macros into every
+    // other app on compositors where the platform layer couldn't determine
+    // focus (notably Niri without an explicit IPC call). Macros may stop
+    // firing if our focus source dies — that is strictly safer than firing
+    // them into the wrong window. The dedicated `allow_background` flag on
+    // each macro remains the explicit way to opt into cross-app firing.
+    log::debug!("[input] focus unknown (fg_pid=0); denying suppression");
     false
 }
 
@@ -570,9 +598,26 @@ fn handle_hotkey_key(state: &HookSharedState, key_name: &str, is_down: bool) -> 
 mod tests {
     use super::{
         handle_hotkey_key, should_consume_hotkey_event, HookSharedState, HotkeyInfo, HotkeyMode,
-        Transition,
+        Transition, TEST_FOCUSED_PID,
     };
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+
+    /// Helper: every test that touches the suppression gate sets a synthetic
+    /// foreground PID and resets it on drop, so concurrent tests can't
+    /// observe each other's injected focus.
+    struct FocusGuard(u32);
+    impl FocusGuard {
+        fn set(pid: u32) -> Self {
+            TEST_FOCUSED_PID.store(pid, Ordering::Release);
+            FocusGuard(pid)
+        }
+    }
+    impl Drop for FocusGuard {
+        fn drop(&mut self) {
+            TEST_FOCUSED_PID.store(0, Ordering::Release);
+        }
+    }
 
     #[test]
     fn active_macro_hotkey_suppresses_key_repeat_without_redispatching() {
@@ -591,22 +636,25 @@ mod tests {
             "rbutton".to_string(),
             Arc::new(HotkeyInfo::new(HotkeyMode::Hold)),
         );
-        state.engine_active.store(true, std::sync::atomic::Ordering::Release);
-        state.game_pid.store(42, std::sync::atomic::Ordering::Release);
-        state.game_alive.store(true, std::sync::atomic::Ordering::Release);
+        state.engine_active.store(true, Ordering::Release);
+        state.game_pid.store(42, Ordering::Release);
+        state.game_alive.store(true, Ordering::Release);
         state
     }
 
     #[test]
     fn release_while_gate_closed_still_advances_state_machine() {
         let state = armed_state();
+        let _focus = FocusGuard::set(42); // game focused → gate open
 
-        // Gate open (game alive): press is consumed and activates the hotkey.
+        // Gate open (game focused): press is consumed and activates the hotkey.
         assert!(handle_hotkey_key(&state, "rbutton", true));
         assert!(state.hotkeys.lock()["rbutton"].is_active());
 
-        // Gate closes between press and release (focus lost / game exited).
-        state.game_alive.store(false, std::sync::atomic::Ordering::Release);
+        // Gate closes between press and release (focus lost).
+        drop(_focus);
+        let _focus_unknown = FocusGuard::set(0); // unknown focus → gate closed
+        state.game_alive.store(false, Ordering::Release);
 
         // The release PASSES THROUGH (gate closed, not our event anymore)…
         assert!(!handle_hotkey_key(&state, "rbutton", false));
@@ -615,7 +663,9 @@ mod tests {
 
         // Next press with the gate open starts cleanly instead of being
         // swallowed as "autorepeat" — the old bug made this impossible.
-        state.game_alive.store(true, std::sync::atomic::Ordering::Release);
+        drop(_focus_unknown);
+        let _focus = FocusGuard::set(42);
+        state.game_alive.store(true, Ordering::Release);
         assert!(handle_hotkey_key(&state, "rbutton", true));
         assert!(state.hotkeys.lock()["rbutton"].is_active());
     }
@@ -623,13 +673,48 @@ mod tests {
     #[test]
     fn press_while_gate_closed_does_not_start_a_macro() {
         let state = armed_state();
-        // Gate closed: user is on the desktop, press belongs to the desktop.
-        state.game_alive.store(false, std::sync::atomic::Ordering::Release);
+        // Gate closed: user is on the desktop — focus is a different PID.
+        let _focus = FocusGuard::set(9999);
+        state.game_alive.store(false, Ordering::Release);
 
         assert!(!handle_hotkey_key(&state, "rbutton", true));
         assert!(
             !state.hotkeys.lock()["rbutton"].is_active(),
             "desktop press must not arm the hotkey"
         );
+    }
+
+    #[test]
+    fn unknown_focus_fails_closed_even_when_game_is_alive() {
+        // Regression: under Niri without an explicit IPC call, the platform
+        // layer returned PID 0 for the foreground window. The old gate then
+        // fell back to `game_alive`, so any registered hotkey press was
+        // suppressed and the macro fired — even if the user was typing in
+        // a browser. New contract: unknown focus → no suppression.
+        let state = armed_state();
+        let _focus = FocusGuard::set(0); // unknown focus
+        state.game_alive.store(true, Ordering::Release);
+
+        assert!(
+            !handle_hotkey_key(&state, "rbutton", true),
+            "press with unknown focus must pass through to the focused app"
+        );
+        assert!(
+            !state.hotkeys.lock()["rbutton"].is_active(),
+            "press with unknown focus must not arm the hotkey"
+        );
+    }
+
+    #[test]
+    fn own_window_focused_does_not_suppress() {
+        // The user is interacting with macrotool's own UI: hotkeys must
+        // pass through so the QML bindings can react to them. The old
+        // check had `fg_pid != 0` baked in but skipped on the fallback
+        // path; the new check is explicit and survives refactors.
+        let state = armed_state();
+        let _focus = FocusGuard::set(state.own_pid);
+
+        assert!(!handle_hotkey_key(&state, "rbutton", true));
+        assert!(!state.hotkeys.lock()["rbutton"].is_active());
     }
 }
