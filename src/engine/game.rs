@@ -197,7 +197,13 @@ impl GameDetector {
         // the game — the user has the game focused, just via the
         // satellite wrapper.
         if !matched {
-            if let Some(wine_path) = scan_wine_process_for_game(&game_path) {
+            let scan_result = scan_wine_process_for_game(&game_path);
+            log::info!(
+                "[game] scan_wine_process_for_game: game_path={:?} result={:?}",
+                game_path,
+                scan_result
+            );
+            if let Some(wine_path) = scan_result {
                 log::info!(
                     "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {}",
                     fg_pid,
@@ -351,9 +357,19 @@ fn scan_wine_process_for_game(configured: &str) -> Option<String> {
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    // Path::file_name() on Unix treats backslashes as literal chars (not
+    // separators), so for a Windows path like "..\bin64\Client.exe" we'd
+    // get the whole string back as the "filename". Normalize by splitting
+    // on both '/' and '\\' ourselves so a Windows exe path matches the
+    // cmdline basename even on Linux.
     if configured_basename.is_empty() {
         return None;
     }
+    let configured_basename = configured_basename
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(&configured_basename)
+        .to_string();
 
     let entries = std::fs::read_dir("/proc").ok()?;
     for entry in entries.flatten() {
@@ -384,10 +400,12 @@ fn scan_wine_process_for_game(configured: &str) -> Option<String> {
             Some(p) => p,
             None => continue,
         };
-        let basename = std::path::Path::new(&path)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
+        let lowercase = path.to_ascii_lowercase();
+        let basename = lowercase
+            .rsplit(|c: char| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(&lowercase)
+            .to_string();
         if basename == configured_basename {
             return Some(path);
         }
