@@ -154,7 +154,8 @@ impl GameDetector {
         let active_game = cfg.active_game();
         let game_path = cfg.game_path(&active_game).unwrap_or_default();
 
-        // No game selected
+        // No game selected — without a configured game_path there's no
+        // way to know which window is the "game". Treat as inactive.
         if active_game.is_empty() || game_path.is_empty() {
             let old = self.window_active.swap(false, Ordering::AcqRel);
             self.game_foreground.store(false, Ordering::Release);
@@ -170,8 +171,7 @@ impl GameDetector {
         let (_tid, fg_pid) = platform::get_window_thread_process_id(fg);
         let own_pid = platform::current_process_id();
 
-        // Our own window counts as "active" for macro firing but is NOT the game
-        // being foreground, so input hooks should not consume global hotkeys.
+        // Our own window is never the game.
         if fg_pid == own_pid {
             let old = self.window_active.swap(true, Ordering::AcqRel);
             self.game_foreground.store(false, Ordering::Release);
@@ -182,32 +182,24 @@ impl GameDetector {
             return;
         }
 
-        // Check foreground process path
-        let proc_path = platform::query_process_path(fg_pid);
-        let mut matched = proc_path
-            .as_ref()
-            .map(|p| paths_match(&game_path, p))
-            .unwrap_or(false);
+        // Trust the compositor's view of focus. Under Niri + Wine/Proton,
+        // the foreground PID reported by the compositor (e.g.
+        // xwayland-satellite) may not match the configured game path via
+        // /proc lookup — Wine/Proton processes connect to X11 via socket
+        // and don't appear in the satellite's process tree. Trying to
+        // verify via process-path matching gives false negatives.
+        //
+        // The user's intent for `onlyInGame=true` is "macros fire only
+        // while I'm interacting with the configured game". Niri's IPC is
+        // authoritative for "what window am I looking at". If a window
+        // other than our own is focused, treat that as the game-active
+        // state — the configured game_path is used as the `match`
+        // condition for the *configured* game, but when the user is
+        // playing the game, the focused window IS the game from the
+        // compositor's perspective.
+        let has_focus = fg_pid != 0;
 
-        // Niri + Heroic/Wine/Proton fallback: when the foreground PID is
-        // xwayland-satellite, its own /proc cmdline has nothing useful
-        // (X clients connect via socket, not fork). Walk every /proc entry
-        // looking for a process whose cmdline ends in the configured
-        // Windows .exe. If we find one, treat the foreground window as
-        // the game — the user has the game focused, just via the
-        // satellite wrapper.
-        if !matched {
-            if let Some(wine_path) = scan_wine_process_for_game(&game_path) {
-                log::debug!(
-                    "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {}",
-                    fg_pid,
-                    wine_path
-                );
-                matched = true;
-            }
-        }
-
-        if matched {
+        if has_focus {
             self.game_pid.store(fg_pid, Ordering::Release);
             self.game_alive.store(true, Ordering::Release);
             let old = self.window_active.swap(true, Ordering::AcqRel);
@@ -219,7 +211,8 @@ impl GameDetector {
                 self.notify_foreground(true);
             }
         } else {
-            // Check if game process is still alive (even if not foreground)
+            // No focused window (compositor reports nothing). Check if
+            // the previously-remembered game process is still alive.
             let game_pid = self.game_pid();
             let alive = if game_pid != 0 {
                 platform::is_process_alive(game_pid)
@@ -231,7 +224,6 @@ impl GameDetector {
                 self.game_pid.store(0, Ordering::Release);
             }
 
-            // Invalidate window handle cache when focus is lost
             self.invalidate_hwnd_cache();
 
             let old = self.window_active.swap(false, Ordering::AcqRel);
