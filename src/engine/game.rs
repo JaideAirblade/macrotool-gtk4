@@ -198,12 +198,42 @@ impl GameDetector {
         // satellite wrapper.
         if !matched {
             if let Some(wine_path) = scan_wine_process_for_game(&game_path) {
-                log::debug!(
+                log::info!(
                     "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {}",
                     fg_pid,
                     wine_path
                 );
                 matched = true;
+            }
+        }
+
+        // Periodic state log (every ~5s) so the user can see what the
+        // detector is actually seeing. Cheap: a single timestamp check
+        // per 150ms tick. Writes to /tmp/macrotool-detector.log so it's
+        // visible even when macrotool's stderr is /dev/null (launched
+        // from a graphical session).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = LAST_LOG.load(Ordering::Acquire);
+            if now_ms.saturating_sub(last) >= 5000 {
+                LAST_LOG.store(now_ms, Ordering::Release);
+                let line = format!(
+                    "[game] ts={} fg_pid={} game_path={:?} proc_path={:?} matched={} own_pid={}\n",
+                    now_ms,
+                    fg_pid,
+                    game_path,
+                    proc_path,
+                    matched,
+                    own_pid
+                );
+                let _ = std::fs::write("/tmp/macrotool-detector.log",
+                    std::fs::read_to_string("/tmp/macrotool-detector.log")
+                        .unwrap_or_default() + &line);
             }
         }
 
