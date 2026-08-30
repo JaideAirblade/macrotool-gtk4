@@ -130,16 +130,161 @@ impl GameDetector {
         }
     }
 
-    /// Start the detection loop. Polls foreground window every 150ms.
+    /// Start the detection loop. Spawns two threads:
+    /// 1. **Event thread** — subscribes to `niri msg --json event-stream`
+    ///    and reacts to focus/window changes the instant Niri publishes
+    ///    them. No polling latency.
+    /// 2. **Poll thread** — once-a-second fallback that re-runs the full
+    ///    detector (which includes the Wine-cmdline scan) to recover
+    ///    from any events the event-stream missed (Niri hiccup, restart,
+    ///    race at startup).
     pub fn start(self: &Arc<Self>, cfg: Arc<config::Manager>) {
-        let detector = self.clone();
+        let detector1 = self.clone();
+        let detector2 = self.clone();
+        let cfg_for_poll = cfg.clone();
+        let cfg_for_event = cfg.clone();
+
+        // Event-stream thread: instant focus tracking. Every time Niri
+        // emits a focus/window/workspace event we refresh the foreground
+        // cache, and (because the event carries the new pid directly) we
+        // also run the matching check_window path inline so game_pid is
+        // updated on the same instant the user clicked.
         thread::Builder::new()
-            .name("game-detect".into())
-            .spawn(move || loop {
-                detector.check_window(&cfg);
-                thread::sleep(Duration::from_millis(150));
+            .name("game-detect-event".into())
+            .spawn(move || {
+                let socket_env = std::env::var("NIRI_SOCKET").ok();
+                let cfg = cfg_for_event;
+                loop {
+                    if detector1.run_event_stream_iteration(socket_env.as_deref(), cfg.clone()) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    } else {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
             })
-            .expect("spawn game-detect thread");
+            .expect("spawn game-detect-event thread");
+
+        // Poll thread: once-a-second fallback. Runs the full detector
+        // (cfg + Wine-cmdline scan) so a missed event doesn't strand us
+        // in a stale state.
+        thread::Builder::new()
+            .name("game-detect-poll".into())
+            .spawn(move || loop {
+                detector2.check_window(&cfg_for_poll);
+                std::thread::sleep(Duration::from_secs(1));
+            })
+            .expect("spawn game-detect-poll thread");
+    }
+
+    /// Subscribe to `niri msg --json event-stream` and trigger an
+    /// instant detector tick on every relevant event. Returns true on
+    /// a healthy iteration; false on a fatal error so the caller can
+    /// back off and retry.
+    fn run_event_stream_iteration(
+        &self,
+        socket_env: Option<&str>,
+        cfg: Arc<crate::config::Manager>,
+    ) -> bool {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let socket_path = match socket_env {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => match self.find_niri_socket() {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+
+        let mut child = match Command::new("niri")
+            .args(["msg", "--json", "event-stream"])
+            .env("NIRI_SOCKET", &socket_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[detect] niri event-stream spawn failed: {}", e);
+                return false;
+            }
+        };
+
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        };
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let n = match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // Niri closed the stream — it restarted or shut down.
+                    log::warn!("[detect] niri event-stream EOF — reconnecting in 2s");
+                    let _ = child.wait();
+                    return false;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("[detect] niri event-stream read error: {}", e);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            };
+            if n == 0 {
+                continue;
+            }
+            // Cheap event filter. The full event-stream emits one JSON
+            // object per line. We only react to lines that mention focus
+            // or windows — workspace-only changes don't affect us.
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.contains("Window focus")
+                || t.contains("Windows changed")
+                || t.contains("Window opened")
+                || t.contains("Window closed")
+            {
+                // Drive a full detector tick on the spot. The detector
+                // reads cfg, runs the Wine-cmdline scan, updates
+                // game_pid, and notifies the overlay — all on this
+                // thread, all within a couple of ms.
+                self.check_window(&cfg);
+            }
+        }
+    }
+
+    /// Locate the live Niri IPC socket. Honours `$NIRI_SOCKET` first;
+    /// falls back to scanning `/run/user/$UID/` for a working socket
+    /// (skipping stale symlinks whose target has been deleted).
+    fn find_niri_socket(&self) -> Option<String> {
+        if let Ok(p) = std::env::var("NIRI_SOCKET") {
+            if !p.is_empty() && std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        let uid = unsafe { libc::getuid() };
+        let dir = std::path::PathBuf::from(format!("/run/user/{}", uid));
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let s = entry.file_name();
+            let n = s.to_string_lossy();
+            if n.starts_with("niri.wayland-1.") && n.ends_with(".sock") {
+                if entry.path().exists() {
+                    return Some(entry.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
     }
 
     /// Check the foreground window against configured game path.

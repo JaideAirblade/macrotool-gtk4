@@ -439,16 +439,34 @@ fn hook_thread_fn(
 #[cfg(test)]
 static TEST_FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
 
+/// One-shot warn so the emergency-stop explanation doesn't spam the log
+/// on every mouse press after Ctrl+Shift+Esc is hit by accident.
+static PAUSED_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
+
 fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
     if state.paused.load(Ordering::Acquire) {
+        if !PAUSED_WARN_EMITTED.swap(true, Ordering::AcqRel) {
+            log::warn!(
+                "[input] gate DENY: paused=true. Ctrl+Shift+Esc emergency-stop is engaged. \
+                 Press the toggle key (ScrollLock per config) to unpause, or check the \
+                 engine state via the overlay. No macros will fire until unpaused."
+            );
+        }
         return false;
     }
+    // Reset the warn flag when not paused so the next accidental trigger
+    // is logged again (helpful if the user paused, debugged, unpaused,
+    // and re-paused by accident — they'd otherwise miss the second
+    // warning).
+    PAUSED_WARN_EMITTED.store(false, Ordering::Release);
     if !state.engine_active.load(Ordering::Acquire) {
+        log::trace!("[input] gate deny: engine_active=false (toggle key off)");
         return false;
     }
 
     let game_pid = state.game_pid.load(Ordering::Acquire);
     if game_pid == 0 {
+        log::trace!("[input] gate deny: game_pid=0 (no game configured/detected)");
         return false;
     }
 
@@ -571,9 +589,18 @@ fn handle_hotkey_key(state: &HookSharedState, key_name: &str, is_down: bool) -> 
     // A press while the gate is closed belongs to the desktop, not the
     // game: revert the FSM so nothing wedges and never START a macro from
     // a desktop press (keys would be injected into the focused app).
-    if !gate_open && matches!(transition, Transition::Start | Transition::Toggle) {
+    //
+    // Anti-wedge: also reset the FSM on every gate-closed event when the
+    // hotkey is mid-Press. Without this, a single stray press while the
+    // game was unfocused (e.g. user alt-tabbed to a chat window for one
+    // second and bumped the mouse button) leaves the FSM in Pressed/Holding
+    // forever; the next press during the game then returns Transition::None
+    // (autorepeat) and the macro never fires until macrotool restarts.
+    if !gate_open {
         hk.set_state(HotkeyState::Idle);
-        return false;
+        if matches!(transition, Transition::Start | Transition::Toggle) {
+            return false;
+        }
     }
 
     log::debug!(

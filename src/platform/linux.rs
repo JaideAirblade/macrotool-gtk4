@@ -749,42 +749,95 @@ fn niri_foreground_pid() -> Option<u32> {
 
     // Synchronous run — called from the game-detector poll thread every
     // 150ms, NOT from the key-event hot path. If Niri hangs (e.g.
-    // compositing stall), we want the detector to skip this tick and rely
-    // on the next one, not block the input pipeline.
-    let output = Command::new("niri")
+    // compositing stall, busy GPU, IPC socket wedged), the spawn-wait
+    // MUST time out so the detector thread keeps ticking. Otherwise the
+    // cached foreground PID goes stale forever and macros stop firing.
+    //
+    // 100 ms cap is well under the 150 ms poll interval so each tick still
+    // completes even when Niri hangs, and the thread keeps moving.
+    let mut child = Command::new("niri")
         .args(["msg", "-j", "focused-window"])
         .env("NIRI_SOCKET", &socket)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
-        .ok()?
-        .wait_with_output();
+        .ok()?;
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_millis(100);
 
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
-
-    if !output.status.success() {
-        // "No window is focused" is the normal idle case — quiet debug log,
-        // no warning noise.
-        log::trace!(
-            "[linux] niri msg -j focused-window failed: status={:?} stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return None;
-    }
-
-    let json = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-        Ok(v) => v,
-        Err(e) => {
-            log::debug!("[linux] niri focused-window JSON parse failed: {}", e);
-            return None;
+    // Drain stdout/stderr in the background while waiting, so a chatty
+    // Niri can't block on a full pipe. We don't need the data — we only
+    // care whether `niri msg` exited cleanly and in time.
+    let mut stdout_handle = child.stdout.take();
+    let mut stderr_handle = child.stderr.take();
+    let drain_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        fn drain<R: Read>(mut s: R) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            out
         }
-    };
+        let stdout = stdout_handle.take().map(drain);
+        let stderr = stderr_handle.take().map(drain);
+        (stdout.unwrap_or_default(), stderr.unwrap_or_default())
+    });
 
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The drain thread has been reading stdout/stderr in the
+                // background; wait for it so we get the full output
+                // before checking status / parsing JSON.
+                let (stdout_bytes, stderr_bytes) =
+                    drain_thread.join().unwrap_or_default();
+                let _ = child.wait();
+                if !status.success() {
+                    log::trace!(
+                        "[linux] niri msg -j focused-window failed: status={:?} stderr={}",
+                        status.code(),
+                        String::from_utf8_lossy(&stderr_bytes).trim()
+                    );
+                    return None;
+                }
+                return parse_niri_focused_window(&stdout_bytes);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    log::warn!(
+                        "[linux] niri msg timed out after {:?} — killing the stuck \
+                         subprocess and continuing with the cached focus. Focus \
+                         tracking may be stale until Niri recovers.",
+                        timeout
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = drain_thread.join();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = drain_thread.join();
+                return None;
+            }
+        }
+    }
+}
+
+/// Parse the JSON returned by `niri msg -j focused-window`. Extracted so
+/// the timeout-wrapped call site above stays readable.
+fn parse_niri_focused_window(stdout: &[u8]) -> Option<u32> {
+    let json = serde_json::from_slice::<serde_json::Value>(stdout).ok()?;
     json.get("pid")
         .and_then(|p| p.as_u64())
         .filter(|&p| p != 0)
@@ -794,10 +847,21 @@ fn niri_foreground_pid() -> Option<u32> {
 /// Locate the Niri IPC socket. Honour `$NIRI_SOCKET` first (set by the
 /// compositor when launching child processes), then fall back to scanning
 /// `/run/user/<uid>/` for a `niri.wayland-1.*.sock` file.
+///
+/// Skips stale sockets whose target is missing (broken symlinks left over
+/// from a previous Niri instance whose PID no longer exists). Without this
+/// filter, a stale socket name with a higher readdir() order would shadow
+/// the new, working socket and silently break focus tracking forever.
 fn niri_socket_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("NIRI_SOCKET") {
         if !p.is_empty() {
-            return Some(PathBuf::from(p));
+            let path = PathBuf::from(p);
+            // Probe the env-pinned socket first; if it's a broken symlink
+            // or otherwise unreachable, fall through to the directory scan
+            // so we don't permanently lock onto a dead path.
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
     // Best-effort scan of /run/user/$UID/. We don't fail loudly if the
@@ -810,7 +874,12 @@ fn niri_socket_path() -> Option<PathBuf> {
         let name = entry.file_name();
         let s = name.to_string_lossy();
         if s.starts_with("niri.wayland-1.") && s.ends_with(".sock") {
-            return Some(entry.path());
+            // exists() follows broken symlinks correctly — if Niri was
+            // restarted under a new PID and left the old symlink dangling,
+            // .exists() returns false here and we skip past it.
+            if entry.path().exists() {
+                return Some(entry.path());
+            }
         }
     }
     None
