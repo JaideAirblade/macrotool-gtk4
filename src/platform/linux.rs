@@ -20,6 +20,7 @@ use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -269,9 +270,26 @@ static KEY_GRAB_NEEDED: AtomicBool = AtomicBool::new(false);
 static INJECTED_DOWN: Lazy<Mutex<HashSet<u16>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// evdev device paths that have a live reader thread.
-static ACTIVE_DEVICES: Lazy<Mutex<HashSet<PathBuf>>> =
-    Lazy::new(|| Mutex::new(HashSet::new()));
+/// Live evdev readers, keyed by their device path. The value is a "reaper"
+/// flag the rescan thread sets to true when it detects the underlying device
+/// has been replaced (wireless dongle re-enumerated onto the same node).
+/// The reader checks this flag each iteration and exits if set.
+static ACTIVE_READERS: Lazy<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// True while the device behind `path` is still the same physical device
+/// we opened. When the dongle re-enumerates and kernel reuses the node
+/// number, the path stays valid but the device behind it is new — `fetch_events`
+/// never returns ENODEV, so the reader would otherwise sit wedged on a stale fd.
+fn is_reader_alive(flag: &AtomicBool) -> bool {
+    !flag.load(Ordering::Acquire)
+}
+
+fn kill_reader(path: &Path) {
+    if let Some(flag) = ACTIVE_READERS.lock().get(path).cloned() {
+        flag.store(true, Ordering::Release);
+    }
+}
 
 /// Path of the device that owns the keyboard hotkey callback.
 static PRIMARY_KB_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -398,7 +416,12 @@ fn device_reader_loop(mut dev: evdev::Device, path: PathBuf, is_primary: bool) {
         is_primary,
         is_keyboard
     );
-    ACTIVE_DEVICES.lock().insert(path.clone());
+    // Register this reader with the rescan thread so it can detect when a
+    // wireless dongle re-enumerates onto the same /dev/input/eventN node
+    // (kernel reuses the slot, path stays valid, fetch_events never returns
+    // ENODEV — the old reader sits wedged on a stale fd until process exit).
+    let reaper = Arc::new(AtomicBool::new(false));
+    ACTIVE_READERS.lock().insert(path.clone(), reaper.clone());
     if is_primary {
         *PRIMARY_KB_PATH.lock() = Some(path.clone());
     }
@@ -419,6 +442,16 @@ fn device_reader_loop(mut dev: evdev::Device, path: PathBuf, is_primary: bool) {
 
     loop {
         if HOOK_STOP.load(Ordering::Acquire) {
+            break;
+        }
+        // Wireless dongle re-enumeration check: if the rescan thread
+        // detected the device behind our path is now a different physical
+        // device, exit so a fresh reader can take over.
+        if !is_reader_alive(&reaper) {
+            log::warn!(
+                "[linux] reader for {} reaped (device identity changed)",
+                path.display()
+            );
             break;
         }
 
@@ -501,12 +534,15 @@ fn device_reader_loop(mut dev: evdev::Device, path: PathBuf, is_primary: bool) {
     }
 
     // ── Thread exit cleanup ────────────────────────────────────────────
-    // The device is gone or wedged. While grabbed, its key-ups can never
-    // arrive through us, so synthesize them: fire the hook callbacks with
-    // is_down=false (updates the hotkey state machine + physical_down so
-    // hold macros stop cleanly) and release everything the virtual device
-    // still holds. This is the anti-stuck-key safety net.
-    if grabbed {
+    // The device is gone, wedged, or reaped. For any keys IT reported as
+    // down, fire the hook callback with is_down=false so the hotkey state
+    // machine clears physical_down (hold macros stop cleanly) and so the
+    // OS doesn't see a stuck mouse button. This used to be guarded by
+    // `if grabbed` — but mice are NEVER grabbed, so a mouse dying mid-hold
+    // would leave rbutton latched in KEY_STATE forever and the next press
+    // would be ignored as a duplicate. Now we always synthesize, for both
+    // grabbed and ungrabbed devices.
+    {
         let downs: Vec<(u16, String)> = local_held
             .iter()
             .filter_map(|code| CODE_TO_NAME.get(code).map(|n| (*code, n.clone())))
@@ -523,16 +559,20 @@ fn device_reader_loop(mut dev: evdev::Device, path: PathBuf, is_primary: bool) {
         }
         if !downs.is_empty() {
             log::warn!(
-                "[linux] synthesized key-up for {} key(s) after {} died",
+                "[linux] synthesized key-up for {} key(s) after {} died (grabbed={})",
                 downs.len(),
-                path.display()
+                path.display(),
+                grabbed
             );
         }
+    }
+    if grabbed {
         release_all_injected();
         KEY_STATE.lock().clear();
         let _ = dev.ungrab();
     }
-    ACTIVE_DEVICES.lock().remove(&path);
+    ACTIVE_READERS.lock().remove(&path);
+    DEVICE_IDENTITY.lock().remove(&path);
     if is_primary {
         *PRIMARY_KB_PATH.lock() = None;
     }
@@ -1394,7 +1434,9 @@ pub fn unhook(_hook: HookHandle) {
 fn spawn_device_readers() -> (Vec<std::thread::JoinHandle<()>>, bool) {
     let mut handles = Vec::new();
     let mut primary_keyboard_seen = false;
-    let already_active = ACTIVE_DEVICES.lock().clone();
+    // Snapshot paths that already have a live reader — we skip them unless
+    // the device behind the path has changed identity (see below).
+    let already_tracked: Vec<PathBuf> = ACTIVE_READERS.lock().keys().cloned().collect();
 
     for (dev, path) in open_input_devices() {
         let is_kb = is_keyboard_device(&dev);
@@ -1402,13 +1444,45 @@ fn spawn_device_readers() -> (Vec<std::thread::JoinHandle<()>>, bool) {
         if !is_kb && !is_mouse {
             continue;
         }
-        if already_active.contains(&path) {
-            continue; // reader thread already running for this node
+        let new_name = dev.name().unwrap_or_default().to_string();
+        let new_uniq = dev.unique_name().unwrap_or_default().to_string();
+        let new_phys = dev.physical_path().unwrap_or_default().to_string();
+
+        if already_tracked.contains(&path) {
+            // Same path: check if the device behind it is still the same
+            // physical device. If not, reap the old reader so a fresh one
+            // can take over. This is the wireless-dongle-re-enumerated-onto-
+            // the-same-node case that used to wedge macrotool silently.
+            let stale = ACTIVE_READERS.lock().get(&path).map(|flag| {
+                // We can't cheaply compare against the old device without
+                // re-opening it ourselves, so we use a stronger signal: the
+                // new device's uniq or phys must match what was opened
+                // before. Track these in a side map keyed by path.
+                !same_identity(path.as_path(), &new_uniq, &new_phys, &new_name)
+            }).unwrap_or(false);
+            if stale {
+                log::warn!(
+                    "[linux] device {} identity drift detected (uniq={} phys={} name={}) — reaping old reader",
+                    path.display(),
+                    new_uniq,
+                    new_phys,
+                    new_name
+                );
+                kill_reader(&path);
+                // Give the reader a moment to notice and exit before we
+                // open a new one against the same node.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                ACTIVE_READERS.lock().remove(&path);
+                // Fall through to spawn a fresh reader below.
+            } else {
+                continue; // reader thread already running for this node
+            }
         }
         let is_primary = is_kb && !primary_keyboard_seen;
         if is_primary {
             primary_keyboard_seen = true;
         }
+        remember_identity(path.as_path(), &new_uniq, &new_phys, &new_name);
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -1423,6 +1497,25 @@ fn spawn_device_readers() -> (Vec<std::thread::JoinHandle<()>>, bool) {
         }
     }
     (handles, primary_keyboard_seen)
+}
+
+/// Identity map for the reaper: which uniq/phys/name combination did we
+/// open for each tracked path? Used to detect wireless dongle re-enumeration
+/// onto the same /dev/input/eventN node.
+static DEVICE_IDENTITY: Lazy<Mutex<HashMap<PathBuf, (String, String, String)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn remember_identity(path: &Path, uniq: &str, phys: &str, name: &str) {
+    DEVICE_IDENTITY
+        .lock()
+        .insert(path.to_path_buf(), (uniq.to_string(), phys.to_string(), name.to_string()));
+}
+
+fn same_identity(path: &Path, uniq: &str, phys: &str, name: &str) -> bool {
+    match DEVICE_IDENTITY.lock().get(path) {
+        Some((u, p, n)) => u == uniq && p == phys && n == name,
+        None => true, // unknown = assume same
+    }
 }
 
 pub fn run_hook_message_loop(_stop_rx: crossbeam_channel::Receiver<()>) -> Result<(), String> {
@@ -1520,5 +1613,67 @@ mod tests {
             process_path_from_cmdline(cmdline).as_deref(),
             Some("Z:\\Games\\SEBNS\\Client.exe")
         );
+    }
+
+    // ── Reaper: wireless dongle re-enumeration detection ────────────────
+    //
+    // When a wireless mouse/keyboard wakes from sleep or power-cycles, the
+    // kernel often reuses the same /dev/input/eventN path. The OLD reader
+    // thread sits wedged on a stale fd because fetch_events never returns
+    // ENODEV and path.exists() returns true. The reaper detects identity
+    // drift (uniq / physical_path / name changed) and forces the old reader
+    // to exit so a fresh one can take over.
+
+    fn check(path: &std::path::Path, uniq: &str, phys: &str, name: &str) -> bool {
+        super::same_identity(path, uniq, phys, name)
+    }
+
+    fn remember(path: &std::path::Path, uniq: &str, phys: &str, name: &str) {
+        super::remember_identity(path, uniq, phys, name);
+    }
+
+    #[test]
+    fn reaper_unknown_path_is_treated_as_same() {
+        // A path we haven't seen before has no recorded identity, so we
+        // optimistically consider it "same" — this prevents the rescan from
+        // needlessly reaping freshly-opened readers.
+        let p = std::path::PathBuf::from("/tmp/macrotool-test-unknown");
+        assert!(check(&p, "uniq-a", "phys-a", "name-a"));
+    }
+
+    #[test]
+    fn reaper_detects_uniq_change() {
+        let p = std::path::PathBuf::from("/tmp/macrotool-test-uniq");
+        remember(&p, "old-uniq", "phys-x", "name-x");
+        assert!(check(&p, "old-uniq", "phys-x", "name-x")); // same
+        assert!(!check(&p, "new-uniq", "phys-x", "name-x")); // drifted
+    }
+
+    #[test]
+    fn reaper_detects_phys_change() {
+        let p = std::path::PathBuf::from("/tmp/macrotool-test-phys");
+        remember(&p, "uniq-x", "old-phys", "name-x");
+        assert!(check(&p, "uniq-x", "old-phys", "name-x"));
+        assert!(!check(&p, "uniq-x", "new-phys", "name-x"));
+    }
+
+    #[test]
+    fn reaper_detects_name_change() {
+        let p = std::path::PathBuf::from("/tmp/macrotool-test-name");
+        remember(&p, "uniq-x", "phys-x", "SCYROX 8K Dongle");
+        assert!(check(&p, "uniq-x", "phys-x", "SCYROX 8K Dongle"));
+        assert!(!check(&p, "uniq-x", "phys-x", "SCYROX 8K Dongle v2"));
+    }
+
+    #[test]
+    fn reaper_handles_empty_identities() {
+        // Some devices report empty uniq/phys (e.g. virtual uinput devices).
+        // Empty-empty-empty should be treated as "same" only if both sides
+        // are empty-empty-empty — any non-empty value on one side but not
+        // the other is identity drift.
+        let p = std::path::PathBuf::from("/tmp/macrotool-test-empty");
+        remember(&p, "", "", "uinput-device");
+        assert!(check(&p, "", "", "uinput-device"));
+        assert!(!check(&p, "real-uniq", "", "uinput-device"));
     }
 }
