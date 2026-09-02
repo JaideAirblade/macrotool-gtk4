@@ -721,6 +721,56 @@ pub fn current_process_id() -> u32 {
     std::process::id()
 }
 
+/// Root path for `/proc`-style process metadata. Defaults to `/proc`; tests
+/// override it via `ProcRootGuard` to point at a `TempDir` of fake entries.
+fn proc_root() -> std::path::PathBuf {
+    PROC_ROOT
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc"))
+}
+
+/// Convenience: build `<proc_root>/<pid>/<suffix>` for per-pid files. Avoids
+/// sprinkling `format!("/proc/...")` strings through the helpers and makes
+/// the test override (a `TempDir`) transparent to callers.
+fn proc_pid_path(pid: u32, suffix: &str) -> std::path::PathBuf {
+    proc_root().join(format!("{pid}/{suffix}"))
+}
+
+/// Convenience: build `<proc_root>/<pid>/task/<tid>/children`.
+fn proc_children_path(pid: u32) -> std::path::PathBuf {
+    proc_root().join(format!("{pid}/task/{pid}/children"))
+}
+
+thread_local! {
+    static PROC_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: override `/proc` resolution with a TempDir containing the
+/// `status`, `cmdline`, `exe` and `task/<tid>/children` files the helpers
+/// expect. Restores the previous root on drop. Nestable.
+#[cfg(test)]
+pub(crate) struct ProcRootGuard {
+    previous: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+impl ProcRootGuard {
+    pub fn install(root: std::path::PathBuf) -> Self {
+        let previous = PROC_ROOT.with(|cell| cell.borrow_mut().replace(root));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProcRootGuard {
+    fn drop(&mut self) {
+        PROC_ROOT.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 pub fn get_foreground_window() -> WindowHandle {
     // Hot path: atomic load of the cached foreground PID. The cache is
     // refreshed by `refresh_foreground_cache()` below, which the game
@@ -1090,125 +1140,6 @@ pub fn get_screen_resolution() -> (i32, i32) {
     (SCREEN_W.load(Ordering::Acquire), SCREEN_H.load(Ordering::Acquire))
 }
 
-pub fn enum_windows_for_pid<F>(pid: u32, f: &mut F)
-where
-    F: FnMut(WindowHandle),
-{
-    f(WindowHandle(pid as u64));
-}
-
-fn process_path_from_cmdline(data: &[u8]) -> Option<String> {
-    let args: Vec<&[u8]> = data.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
-
-    // Wine/Proton commonly puts its loader in argv[0] and the Windows game
-    // executable in a later argument. Prefer that executable when present.
-    args.iter()
-        .map(|arg| String::from_utf8_lossy(arg))
-        .find(|arg| arg.to_lowercase().ends_with(".exe"))
-        .map(|arg| arg.into_owned())
-        .or_else(|| {
-            args.first()
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-        })
-}
-
-pub fn query_process_path(pid: u32) -> Option<String> {
-    // For native Linux apps, /proc/{pid}/exe is the real binary.
-    // For Wine/Proton games, /proc/{pid}/exe points to the wine64 binary
-    // (a Linux executable), NOT the Windows .exe. In that case the cmdline
-    // contains the Windows path (e.g. "Z:\Games\SEBNS\bin64\Client.exe").
-    // Strategy: read exe first. If it's NOT a .exe (i.e. it's a Linux binary
-    // like wine64/preloader), fall back to cmdline which has the Windows exe.
-    let exe_path = PathBuf::from(format!("/proc/{}/exe", pid));
-    if let Ok(p) = std::fs::read_link(&exe_path) {
-        let path_str = p.to_string_lossy().to_string();
-        let lower = path_str.to_lowercase();
-        if lower.ends_with(".exe") {
-            // Native Windows exe (unlikely on Linux, but handle it).
-            return Some(path_str);
-        }
-        // It's a Linux binary (wine64, wineserver, proton, etc.).
-        // Don't return it — fall through to cmdline.
-    }
-
-    // Read /proc/{pid}/cmdline — null-separated args.
-    let cmd = PathBuf::from(format!("/proc/{}/cmdline", pid));
-    if let Ok(data) = std::fs::read(&cmd) {
-        // cmdline is null-separated. The first arg is usually the executable
-        // path. For Wine it's often "Z:\path\to\Client.exe".
-        if let Some(path) = process_path_from_cmdline(&data) {
-            return Some(path);
-        }
-    }
-
-    // Special case for xwayland-satellite under Niri: Wine/Proton X11 apps
-    // are fronted by an xwayland-satellite instance whose own cmdline has
-    // no useful info, but whose child tree contains the actual game loader
-    // (wine-preloader / proton / wine64) — and that child has the Windows
-    // exe path in its cmdline. Walk the child tree to find it. This is the
-    // bridge that lets the detector match under Niri + Heroic/Wine/Proton.
-    if let Some(p) = query_child_wine_path(pid) {
-        return Some(p);
-    }
-
-    // Absolute last resort: return the exe path even if it's not .exe.
-    if let Ok(p) = std::fs::read_link(&exe_path) {
-        return Some(p.to_string_lossy().to_string());
-    }
-    None
-}
-
-/// If `pid` is (or hosts) a Wine/Proton game process, return the Windows
-/// exe path found in that process's cmdline. Used to identify the real game
-/// under Niri's xwayland-satellite wrapper.
-///
-/// Walks one level of children looking for processes whose cmdline contains
-/// a Windows-style path ending in `.exe`. Recursion is intentionally one
-/// level deep — Wine launchers are direct children of xwayland-satellite,
-/// and deeper walks add latency on every 150ms detector tick.
-fn query_child_wine_path(pid: u32) -> Option<String> {
-    let children = read_child_pids(pid)?;
-    for child in children {
-        let cmd_path = PathBuf::from(format!("/proc/{}/cmdline", child));
-        if let Ok(data) = std::fs::read(&cmd_path) {
-            if let Some(path) = process_path_from_cmdline(&data) {
-                if path.to_lowercase().ends_with(".exe") {
-                    return Some(path);
-                }
-            }
-        }
-        // Also try the child's exe in case the cmdline doesn't have the
-        // Windows path (some Proton variants).
-        let child_exe = PathBuf::from(format!("/proc/{}/exe", child));
-        if let Ok(p) = std::fs::read_link(&child_exe) {
-            let s = p.to_string_lossy().to_string();
-            if s.to_lowercase().ends_with(".exe") {
-                return Some(s);
-            }
-        }
-    }
-    None
-}
-
-/// Read /proc/<pid>/task/<tid>/children to enumerate direct children.
-/// Returns PIDs (as u32).
-fn read_child_pids(pid: u32) -> Option<Vec<u32>> {
-    // The first task's children file lists all direct children.
-    let path = PathBuf::from(format!("/proc/{}/task/{}/children", pid, pid));
-    let data = std::fs::read_to_string(&path).ok()?;
-    let mut out = Vec::new();
-    for tok in data.split_whitespace() {
-        if let Ok(p) = tok.parse::<u32>() {
-            out.push(p);
-        }
-    }
-    Some(out)
-}
-
-pub fn is_process_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{}", pid)).exists()
-}
-
 // ── Input injection ──────────────────────────────────────────────────────
 
 pub fn send_key(key: &str) {
@@ -1228,11 +1159,6 @@ pub fn send_key(key: &str) {
     // frame — a near-zero hold is missed or mis-latched by some engines.
     thread::sleep(TAP_HOLD);
     send_linux_key(code, true);
-}
-
-pub fn send_key_to_window(_hwnd: WindowHandle, key: &str) {
-    // Wayland has no direct per-window injection; inject globally.
-    send_key(key);
 }
 
 fn send_mouse(key: &str, up: bool) {
@@ -1599,7 +1525,7 @@ pub struct RECT {
 
 #[cfg(test)]
 mod tests {
-    use super::{grabbed_event_route, process_path_from_cmdline, EventRoute};
+    use super::{grabbed_event_route, parse_cmdline_last_exe_basename, EventRoute};
 
     #[test]
     fn hybrid_primary_mouse_button_uses_mouse_route() {
@@ -1610,8 +1536,8 @@ mod tests {
     fn wine_cmdline_prefers_the_game_executable_over_the_loader() {
         let cmdline = b"/nix/store/wine64-preloader\0Z:\\Games\\SEBNS\\Client.exe\0--flag\0";
         assert_eq!(
-            process_path_from_cmdline(cmdline).as_deref(),
-            Some("Z:\\Games\\SEBNS\\Client.exe")
+            parse_cmdline_last_exe_basename(cmdline).as_deref(),
+            Some("client.exe")
         );
     }
 
@@ -1675,5 +1601,538 @@ mod tests {
         remember(&p, "", "", "uinput-device");
         assert!(check(&p, "", "", "uinput-device"));
         assert!(!check(&p, "real-uniq", "", "uinput-device"));
+    }
+}
+
+// ── PID-free game detection ─────────────────────────────────────────────
+//
+// The previous detector cached a `game_pid` and a `cached_game_hwnd` and
+// compared the focused PID against that cached value. Any drift between
+// the cached PID and reality (Wine re-exec, xwayland-satellite handing the
+// surface to a different process, a game that forks its render process
+// after the splash screen) silently wedged the gate: the cache held a dead
+// PID, every comparison failed, and no macro ever fired again until
+// macrotool restarted.
+//
+// The replacement stores NOTHING. Every question is answered from /proc at
+// the moment it is asked, by comparing executable BASENAMES:
+//
+//   * `focused_window_is_game` — is the currently focused PID's exe the
+//     configured game exe?
+//   * `find_live_game_exe` — is a process with the configured game exe
+//     running at all (regardless of focus)?
+//
+// Both fail CLOSED: any missing config, unreadable /proc entry, zombie
+// process, or IO error yields "not the game" rather than a stale yes.
+
+/// Case-insensitive basename of a path, normalising Windows separators.
+///
+/// Wine reports the game executable with backslashes
+/// (`Z:\Games\SEBNS\bin64\Client.exe`) while the configured path is a Linux
+/// path (`/media/games/SEBNS/bin64/Client.exe`). `Path::file_name()` on Unix
+/// treats `\` as an ordinary character, so a Windows path would come back
+/// whole. Normalise `\` to `/` first, lowercase, drop any trailing NULs
+/// (`/proc/<pid>/comm` and `cmdline` are NUL-terminated), then take the last
+/// path component.
+pub(crate) fn path_basename_ci(s: &str) -> String {
+    let normalized = s
+        .replace('\\', "/")
+        .trim_end_matches('\0')
+        .trim()
+        .to_lowercase();
+    normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+/// Read the one-letter scheduler state from `/proc/<pid>/status`.
+///
+/// Returns `"R"`, `"S"`, `"D"`, `"Z"`, `"T"`, … or `None` when the file is
+/// unreadable (process exited, or we lack permission).
+fn proc_state_string(pid: u32) -> Option<String> {
+    let path = proc_pid_path(pid, "status");
+    let status = std::fs::read_to_string(&path).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("State:") {
+            return rest.split_whitespace().next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Is `pid` a zombie? A zombie still has a `/proc` entry and a readable
+/// exe link, but it is not running anything — treat it as gone.
+fn is_zombie(pid: u32) -> bool {
+    matches!(proc_state_string(pid).as_deref(), Some("Z"))
+}
+
+/// Walk a `/proc/<pid>/cmdline`-shaped byte buffer (NUL-separated args)
+/// and return the basename of the LAST argument that ends in `.exe`
+/// (case-insensitive). Returns `None` when the buffer is empty or
+/// contains no `.exe` argument.
+///
+/// This is the Wine/Proton fallback: under umu-launcher / DW-Proton,
+/// `/proc/<pid>/exe` is `wine-preloader` but the cmdline carries the
+/// Windows game path as the last argument
+/// (e.g. `c:\windows\system32\umu.exe ... Launcher.exe`). The last `.exe`
+/// argument is the game executable the user wants to match.
+fn parse_cmdline_last_exe_basename(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    // /proc/<pid>/cmdline is NUL-separated, with a trailing NUL. Skip the
+    // trailing empty split that always lands at the end.
+    let mut last_exe: Option<String> = None;
+    for arg in data.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let s = String::from_utf8_lossy(arg);
+        let lowered = s.to_ascii_lowercase();
+        if lowered.ends_with(".exe") {
+            last_exe = Some(path_basename_ci(&s));
+        }
+    }
+    last_exe
+}
+
+/// Read `/proc/<pid>/cmdline` and return the basename of the LAST `.exe`
+/// argument (case-insensitive). Returns `None` when the file is unreadable,
+/// empty, or contains no `.exe` argument.
+fn cmdline_last_exe_basename(pid: u32) -> Option<String> {
+    let data = std::fs::read(proc_pid_path(pid, "cmdline")).ok()?;
+    parse_cmdline_last_exe_basename(&data)
+}
+
+/// Does `/proc/<pid>/cmdline` end with an argument whose basename equals
+/// `want_basename`? Wine/Proton passes the game executable as the last
+/// argv element, so the last `.exe` arg is the game exe.
+fn cmdline_has_exe_basename(pid: u32, want_basename: &str) -> bool {
+    cmdline_last_exe_basename(pid)
+        .map(|got| !got.is_empty() && got == want_basename)
+        .unwrap_or(false)
+}
+
+/// Read `/proc/<pid>/task/<pid>/children` (whitespace-separated child PIDs).
+///
+/// Returns an empty Vec on any IO/parse error — callers treat the absence of
+/// child info as "no children to inspect" rather than a fatal failure.
+fn read_child_pids(pid: u32) -> Vec<u32> {
+    match std::fs::read_to_string(proc_children_path(pid)) {
+        Ok(s) => s
+            .split_whitespace()
+            .filter_map(|t| t.parse::<u32>().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Does `pid`'s executable basename equal `want_basename`?
+///
+/// Fails closed on: empty `want_basename`, pid 0, our own pid, zombie
+/// processes, and any IO error. Reads `/proc/<pid>/exe` first and falls back
+/// to `/proc/<pid>/comm` when the symlink is unreadable (a `/proc/<pid>/exe`
+/// readlink needs the same uid or CAP_SYS_PTRACE; `comm` is world-readable,
+/// but truncated to 15 bytes, so it is only a fallback). Finally tries the
+/// `/proc/<pid>/cmdline` last-`.exe`-arg fallback for Wine/Proton, and walks
+/// one level into children for sibling client processes.
+fn exe_basename_matches(pid: u32, want_basename: &str) -> bool {
+    if want_basename.is_empty() {
+        return false;
+    }
+    if pid == 0 || pid == current_process_id() {
+        return false;
+    }
+    // A zombie still has a /proc entry and a readable exe link, but it is
+    // not running anything — treat it as gone.
+    if is_zombie(pid) {
+        return false;
+    }
+
+    if let Ok(target) = std::fs::read_link(proc_pid_path(pid, "exe")) {
+        let got = path_basename_ci(&target.to_string_lossy());
+        if !got.is_empty() && got == want_basename {
+            return true;
+        }
+    }
+
+    // Fallback: /proc/<pid>/comm. Truncated to TASK_COMM_LEN-1 (15) bytes,
+    // so compare against a matching prefix of the wanted basename.
+    if let Ok(comm) = std::fs::read_to_string(proc_pid_path(pid, "comm")) {
+        let got = path_basename_ci(&comm);
+        if got.is_empty() {
+            return false;
+        }
+        if got == want_basename {
+            return true;
+        }
+        // comm truncation: "SomeVeryLongName.exe" arrives as 15 chars.
+        if got.len() == 15 && want_basename.len() > 15 && want_basename.starts_with(&got) {
+            return true;
+        }
+    }
+
+    // Wine/Proton fallback: /proc/<pid>/cmdline. The umu-shim/Wine loader
+    // reports itself (wine-preloader) as /proc/<pid>/exe, but the cmdline
+    // carries the Windows .exe path as the last argument.
+    if cmdline_has_exe_basename(pid, want_basename) {
+        return true;
+    }
+
+    // Wine games sometimes spawn a dedicated Client.exe child; check each
+    // child's exe + cmdline (one level deep) before giving up.
+    for child in read_child_pids(pid) {
+        if child == 0 || child == current_process_id() {
+            continue;
+        }
+        if is_zombie(child) {
+            continue;
+        }
+        if let Ok(target) = std::fs::read_link(proc_pid_path(child, "exe")) {
+            let got = path_basename_ci(&target.to_string_lossy());
+            if !got.is_empty() && got == want_basename {
+                return true;
+            }
+        }
+        if cmdline_has_exe_basename(child, want_basename) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Is the currently focused window owned by the configured game?
+///
+/// Fresh per call — nothing is cached. Returns false when no game is
+/// configured, when the configured game has no path, when focus is unknown
+/// (PID 0 — Niri IPC down, no X11), when our own window is focused, or when
+/// the focused process's exe basename is not the game's.
+pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
+    let active = cfg.active_game();
+    if active.is_empty() {
+        return false;
+    }
+    let game_path = match cfg.game_path(&active) {
+        Some(p) => p,
+        None => return false,
+    };
+    if game_path.is_empty() {
+        return false;
+    }
+    let want = path_basename_ci(&game_path);
+    if want.is_empty() {
+        return false;
+    }
+
+    let hwnd = get_foreground_window();
+    let (_tid, pid) = get_window_thread_process_id(hwnd);
+    if pid == 0 || pid == current_process_id() {
+        return false;
+    }
+    exe_basename_matches(pid, &want)
+}
+
+/// Find a live process whose executable basename matches the configured
+/// game, and return that process's real executable path.
+///
+/// Walks `/proc` on every call — no cache, no stored pid. Skips pid 0, our
+/// own process, and zombies. Falls back to `/proc/<pid>/cmdline` (and one
+/// level into the pid's children) for Wine/Proton setups where
+/// `/proc/<pid>/exe` is `wine-preloader` rather than the game exe; in that
+/// case the Windows `.exe` path is reconstructed from the cmdline arg.
+pub fn find_live_game_exe(cfg: &crate::config::Manager) -> Option<std::path::PathBuf> {
+    let active = cfg.active_game();
+    if active.is_empty() {
+        return None;
+    }
+    let game_path = cfg.game_path(&active)?;
+    if game_path.is_empty() {
+        return None;
+    }
+    let want = path_basename_ci(&game_path);
+    if want.is_empty() {
+        return None;
+    }
+
+    let own = current_process_id();
+    for entry in std::fs::read_dir(proc_root()).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == 0 || pid == own {
+            continue;
+        }
+        if is_zombie(pid) {
+            continue;
+        }
+        // Primary: /proc/<pid>/exe basename.
+        if let Ok(target) = std::fs::read_link(proc_pid_path(pid, "exe")) {
+            if path_basename_ci(&target.to_string_lossy()) == want {
+                return Some(target);
+            }
+        }
+        // Wine/Proton fallback: cmdline last .exe arg is the Windows game exe.
+        if let Some(arg) = cmdline_last_exe_basename(pid) {
+            if !arg.is_empty() && arg == want {
+                // Reconstruct the Windows path verbatim so the caller can
+                // still see what was matched.
+                if let Some(cmdline) = read_cmdline_arg_for(pid, &want) {
+                    return Some(std::path::PathBuf::from(cmdline));
+                }
+            }
+        }
+        // One level of children: Wine/Proton may spawn a dedicated Client.exe
+        // child process whose exe points to the game (or whose cmdline does).
+        for child in read_child_pids(pid) {
+            if child == 0 || child == own || is_zombie(child) {
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(proc_pid_path(child, "exe")) {
+                if path_basename_ci(&target.to_string_lossy()) == want {
+                    return Some(target);
+                }
+            }
+            if let Some(arg) = cmdline_last_exe_basename(child) {
+                if !arg.is_empty() && arg == want {
+                    if let Some(cmdline) = read_cmdline_arg_for(child, &want) {
+                        return Some(std::path::PathBuf::from(cmdline));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read `/proc/<pid>/cmdline` and return the raw arg whose lowercased
+/// basename equals `want_basename`. Used by `find_live_game_exe` to recover
+/// the original (Windows-style) path that matched the game exe basename.
+fn read_cmdline_arg_for(pid: u32, want_basename: &str) -> Option<String> {
+    let data = std::fs::read(proc_pid_path(pid, "cmdline")).ok()?;
+    for arg in data.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let s = String::from_utf8_lossy(arg).to_string();
+        if path_basename_ci(&s) == want_basename {
+            return Some(s);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod pid_free_focused_window_tests {
+    use super::{
+        exe_basename_matches, find_live_game_exe, focused_window_is_game, path_basename_ci,
+        ProcRootGuard,
+    };
+    use crate::config::Manager;
+    use std::fs;
+    use std::os::unix::fs as unix_fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // ── path_basename_ci ────────────────────────────────────────────────
+
+    #[test]
+    fn basename_takes_the_last_component_of_a_linux_path() {
+        assert_eq!(
+            path_basename_ci("/media/games/SEBNS/bin64/Client.exe"),
+            "client.exe"
+        );
+    }
+
+    #[test]
+    fn basename_normalizes_windows_backslash_separators() {
+        assert_eq!(
+            path_basename_ci("Z:\\Games\\SEBNS\\bin64\\Client.exe"),
+            "client.exe"
+        );
+    }
+
+    #[test]
+    fn basename_lowercases_the_result() {
+        assert_eq!(path_basename_ci("CLIENT.EXE"), "client.exe");
+    }
+
+    #[test]
+    fn basename_trims_a_trailing_null_byte() {
+        // /proc/<pid>/comm and cmdline entries arrive NUL-terminated.
+        assert_eq!(path_basename_ci("Client.exe\0"), "client.exe");
+    }
+
+    #[test]
+    fn basename_handles_mixed_separators() {
+        assert_eq!(
+            path_basename_ci("/mnt/games\\SEBNS/bin64\\Client.EXE"),
+            "client.exe"
+        );
+    }
+
+    #[test]
+    fn basename_of_empty_input_is_empty() {
+        assert_eq!(path_basename_ci(""), "");
+    }
+
+    // ── exe_basename_matches ────────────────────────────────────────────
+
+    #[test]
+    fn exe_match_fails_closed_for_an_empty_wanted_basename() {
+        // Even against our own live pid, an empty target never matches.
+        assert!(!exe_basename_matches(std::process::id(), ""));
+    }
+
+    #[test]
+    fn exe_match_fails_closed_for_a_bogus_pid() {
+        // pid 0 is never a real process, and a pid far above
+        // /proc/sys/kernel/pid_max cannot exist either.
+        assert!(!exe_basename_matches(0, "client.exe"));
+        assert!(!exe_basename_matches(u32::MAX, "client.exe"));
+    }
+
+    // ── focused_window_is_game / find_live_game_exe ─────────────────────
+
+    #[test]
+    fn focused_window_is_not_the_game_when_no_game_is_active() {
+        let cfg = Manager::default_for_tests_empty_active();
+        assert!(!focused_window_is_game(&cfg));
+        assert!(find_live_game_exe(&cfg).is_none());
+    }
+
+    #[test]
+    fn focused_window_is_not_the_game_when_the_game_path_is_empty() {
+        let cfg = Manager::default_for_tests_with_active_game("SEBNS", "");
+        assert!(!focused_window_is_game(&cfg));
+        assert!(find_live_game_exe(&cfg).is_none());
+    }
+
+    // ── Wine/Proton cmdline fallback (C1) ────────────────────────────────
+
+    /// Build a fake `/proc/<pid>/...` tree under `root`. Creates a
+    /// `<root>/<pid>` directory with `status`, `cmdline`, and a dangling
+    /// `exe` symlink (so `read_link` succeeds but the target can be
+    /// anything the test wants). Optionally append `children_pids` and a
+    /// `<root>/<child_pid>/{status,cmdline,exe}` tree for each child.
+    fn build_fake_proc(
+        root: &std::path::Path,
+        pid: u32,
+        status_state: &str, // e.g. "S" or "Z"
+        cmdline: &[&[u8]],
+        exe_target: Option<&std::path::Path>,
+        children: &[(u32, &str, &[&[u8]], Option<&std::path::Path>)],
+    ) {
+        // `proc_pid_path` builds `<root>/<pid>/<suffix>` using `format!`
+        // (no underscore), so the directory name must be the bare decimal
+        // form of `pid`.
+        let pid_dir = root.join(format!("{pid}"));
+        fs::create_dir_all(&pid_dir).unwrap();
+        let status = format!(
+            "Name:\tfake\nUmask:\t0022\nState:\t{status_state}\nTgid:\t{pid}\n",
+        );
+        fs::write(pid_dir.join("status"), status).unwrap();
+
+        // cmdline is NUL-separated. The kernel appends a trailing NUL.
+        let mut buf: Vec<u8> = Vec::new();
+        for arg in cmdline {
+            buf.extend_from_slice(arg);
+            buf.push(0);
+        }
+        fs::write(pid_dir.join("cmdline"), &buf).unwrap();
+
+        if let Some(target) = exe_target {
+            unix_fs::symlink(target, pid_dir.join("exe")).unwrap();
+        }
+
+        if !children.is_empty() {
+            let task_dir = pid_dir.join("task").join(format!("{pid}"));
+            fs::create_dir_all(&task_dir).unwrap();
+            let child_pids: Vec<String> = children.iter().map(|(c, _, _, _)| c.to_string()).collect();
+            fs::write(task_dir.join("children"), child_pids.join(" ")).unwrap();
+        }
+        for (child, state, cmd, exe) in children {
+            build_fake_proc(root, *child, state, cmd, *exe, &[]);
+        }
+    }
+
+    #[test]
+    fn cmdline_fallback_matches_when_exe_does_not() {
+        // Heroic + DW-Proton + umu-launcher look-alike: /proc/<pid>/exe
+        // points at the wine-preloader ELF, but the cmdline carries the
+        // Windows .exe as the last argument.
+        let tmp = TempDir::new().unwrap();
+        let pid = 42_001u32;
+        let exe_target = PathBuf::from(
+            "/home/jaide/.local/share/Steam/compatibilitytools.d/DW-Proton-Latest/files/lib/wine/x86_64-unix/wine-preloader",
+        );
+        let cmdline: &[&[u8]] = &[
+            b"c:\\windows\\system32\\umu.exe",
+            b"--use-gl=angle",
+            b"Launcher.exe",
+            b"Z:\\Games\\SEBNS\\bin64\\Client.exe",
+        ];
+        build_fake_proc(
+            tmp.path(),
+            pid,
+            "S",
+            cmdline,
+            Some(&exe_target),
+            &[],
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        assert!(exe_basename_matches(pid, "client.exe"));
+    }
+
+    #[test]
+    fn cmdline_fallback_matches_a_child_process() {
+        // Wine sometimes spawns a dedicated Client.exe child under the
+        // umu-shim parent. The parent's exe/comm/cmdline don't carry
+        // "client.exe" — only the child's cmdline does.
+        let tmp = TempDir::new().unwrap();
+        let parent = 50_001u32;
+        let child = 50_002u32;
+        let parent_cmd: &[&[u8]] = &[
+            b"c:\\windows\\system32\\umu.exe",
+            b"--use-gl=angle",
+            b"Launcher.exe",
+        ];
+        let child_cmd: &[&[u8]] = &[
+            b"c:\\windows\\system32\\wine-preloader",
+            b"Z:\\Games\\SEBNS\\bin64\\Client.exe",
+        ];
+        build_fake_proc(
+            tmp.path(),
+            parent,
+            "S",
+            parent_cmd,
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+            &[(child, "S", child_cmd, Some(&PathBuf::from("/nix/store/wine-preloader")))],
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        // The parent itself has no matching exe/comm/cmdline, but its child
+        // does — the one-level walk must pick that up.
+        assert!(exe_basename_matches(parent, "client.exe"));
+    }
+
+    #[test]
+    fn zombie_is_rejected_even_when_cmdline_matches() {
+        // A wine-preloader that has exited but whose cmdline is still
+        // readable must NOT count as the game — zombies are gone.
+        let tmp = TempDir::new().unwrap();
+        let pid = 60_001u32;
+        let cmdline: &[&[u8]] = &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"];
+        build_fake_proc(
+            tmp.path(),
+            pid,
+            "Z", // zombie
+            cmdline,
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+            &[],
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        assert!(!exe_basename_matches(pid, "client.exe"));
     }
 }

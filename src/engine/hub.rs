@@ -80,15 +80,14 @@ impl EngineHub {
                     input_mgr.reset_all_states();
                 }
             }));
-        detector_for_fg.register_foreground_callback(Box::new(move |focused, alive, pid| {
+        detector_for_fg.register_foreground_callback(Box::new(move |focused, present| {
             log::info!(
-                "[hub] game foreground changed: focused={} alive={} pid={}",
+                "[hub] game foreground changed: focused={} present={}",
                 focused,
-                alive,
-                pid
+                present
             );
-            input_mgr_fg.set_game_alive(alive);
-            input_mgr_fg.set_game_pid(pid);
+            input_mgr_fg.set_game_in_focus(focused);
+            input_mgr_fg.set_game_present(present);
         }));
 
         // Initial profile load

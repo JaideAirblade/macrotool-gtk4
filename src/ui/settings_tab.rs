@@ -150,15 +150,6 @@ fn make_general_card(
         },
     ));
     card.append(&toggle_row(
-        "Allow Background",
-        s.allow_background,
-        cfg,
-        Some(engine.clone()),
-        |s, v| {
-            s.allow_background = v;
-        },
-    ));
-    card.append(&toggle_row(
         "Auto Detect Game",
         s.auto_detect_game,
         cfg,

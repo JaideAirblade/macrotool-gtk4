@@ -1,6 +1,6 @@
 //! Buff Engine — priority queue of buff timers that fire action keys on expiry.
 //!
-//! Uses a min-heap of expiry times. A background worker thread wakes up at
+//! Uses a min-heap of expiry times. A worker thread wakes up at
 //! the next expiry, fires the action key, and removes the entry.
 
 use crate::config::BuffTimer;
@@ -269,37 +269,42 @@ fn buff_worker(
     }
 }
 
-fn fire_buff_action_key(item: &BuffHeapItem, handle: Option<&EngineHandle>) {
+fn fire_buff_action_key(item: &BuffHeapItem, handle: Option<&EngineHandle>) -> bool {
     if item.buff.action_key.is_empty() {
-        return;
+        return false;
     }
 
+    let mut fired = false;
     if let Some(h) = handle {
         h.input.acquire_sending();
-        // Buffs always fire — use uinput if game is foreground, global injection
-        // if game is alive but backgrounded.
-        let game_pid = h.detector.game_pid();
-        let game_hwnd = if game_pid != 0 {
-            h.detector.get_cached_hwnd()
-        } else {
-            platform::INVALID_WINDOW_HANDLE
-        };
-
-        if is_game_foreground(game_pid) {
+        // Fire only while the game is the focused window. The previous
+        // implementation fell back to a cached window handle when the game
+        // was merely alive, which injected the buff key into whatever the
+        // user had switched to.
+        if h.detector.is_in_focus() {
             platform::send_key(&item.buff.action_key);
-        } else if !game_hwnd.is_null() {
-            platform::send_key_to_window(game_hwnd, &item.buff.action_key);
+            fired = true;
+        } else {
+            log::debug!(
+                "[buff] {} expired but the game is not focused — key {} dropped",
+                item.name,
+                item.buff.action_key
+            );
         }
         h.input.release_sending();
     } else {
         // No handle — just send directly.
         platform::send_key(&item.buff.action_key);
+        fired = true;
     }
-    log::info!(
-        "[buff] expired: {} → fired {}",
-        item.name,
-        item.buff.action_key
-    );
+    if fired {
+        log::info!(
+            "[buff] expired: {} → fired {}",
+            item.name,
+            item.buff.action_key
+        );
+    }
+    fired
 }
 
 fn cooldown_sound_path() -> Option<PathBuf> {
@@ -337,15 +342,6 @@ fn play_cooldown_ready_sound(name: &str) {
             Ok(status) => log::warn!("[buff] cooldown sound exited with {status}: {name}"),
             Err(error) => log::warn!("[buff] could not play cooldown sound for {name}: {error}"),
         });
-}
-
-fn is_game_foreground(game_pid: u32) -> bool {
-    if game_pid == 0 {
-        return false;
-    }
-    let fg = platform::get_foreground_window();
-    let (_, fg_pid) = platform::get_window_thread_process_id(fg);
-    fg_pid == game_pid
 }
 
 #[cfg(test)]

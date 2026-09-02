@@ -7,7 +7,7 @@ use crate::platform;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -46,7 +46,6 @@ pub enum Transition {
 pub struct HotkeyInfo {
     state: AtomicI32,
     enabled: AtomicBool,
-    background: AtomicBool,
     mode: HotkeyMode,
 }
 
@@ -55,7 +54,6 @@ impl HotkeyInfo {
         HotkeyInfo {
             state: AtomicI32::new(0),
             enabled: AtomicBool::new(true),
-            background: AtomicBool::new(false),
             mode,
         }
     }
@@ -82,14 +80,6 @@ impl HotkeyInfo {
 
     pub fn set_enabled(&self, en: bool) {
         self.enabled.store(en, Ordering::Release);
-    }
-
-    pub fn is_background(&self) -> bool {
-        self.background.load(Ordering::Acquire)
-    }
-
-    pub fn set_background(&self, bg: bool) {
-        self.background.store(bg, Ordering::Release);
     }
 
     pub fn on_key_down(&self) -> Transition {
@@ -159,11 +149,14 @@ pub struct HookSharedState {
     pub handlers: Arc<Mutex<Vec<HandlerFn>>>,
     pub physical_down: Arc<Mutex<HashMap<String, bool>>>,
     pub engine_active: Arc<AtomicBool>,
-    pub game_pid: Arc<AtomicU32>,
-    pub game_alive: Arc<AtomicBool>,
+    /// The configured game is the live focused window, as most recently
+    /// determined by the game detector's `/proc` basename comparison. The
+    /// suppression gate reads this and nothing else — it never resolves a
+    /// PID of its own.
+    pub game_in_focus: Arc<AtomicBool>,
+    pub game_present: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
     pub sending: Arc<AtomicBool>,
-    pub own_pid: u32,
 }
 
 impl HookSharedState {
@@ -173,11 +166,10 @@ impl HookSharedState {
             handlers: Arc::new(Mutex::new(Vec::new())),
             physical_down: Arc::new(Mutex::new(HashMap::new())),
             engine_active: Arc::new(AtomicBool::new(false)),
-            game_pid: Arc::new(AtomicU32::new(0)),
-            game_alive: Arc::new(AtomicBool::new(false)),
+            game_in_focus: Arc::new(AtomicBool::new(false)),
+            game_present: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             sending: Arc::new(AtomicBool::new(false)),
-            own_pid: platform::current_process_id(),
         }
     }
 
@@ -213,12 +205,12 @@ impl InputManager {
         &self.state
     }
 
-    pub fn set_game_pid(&self, pid: u32) {
-        self.state.game_pid.store(pid, Ordering::Release);
+    pub fn set_game_in_focus(&self, focused: bool) {
+        self.state.game_in_focus.store(focused, Ordering::Release);
     }
 
-    pub fn set_game_alive(&self, alive: bool) {
-        self.state.game_alive.store(alive, Ordering::Release);
+    pub fn set_game_present(&self, present: bool) {
+        self.state.game_present.store(present, Ordering::Release);
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -238,13 +230,6 @@ impl InputManager {
 
     pub fn clear_hotkeys(&self) {
         self.state.hotkeys.lock().clear();
-    }
-
-    pub fn set_background(&self, name: &str, bg: bool) {
-        let map = self.state.hotkeys.lock();
-        if let Some(hk) = map.get(&name.to_lowercase()) {
-            hk.set_background(bg);
-        }
     }
 
     pub fn set_enabled(&self, name: &str, en: bool) {
@@ -419,31 +404,28 @@ fn hook_thread_fn(
 ///
 /// Suppression logic (fail-closed — when in doubt, pass the key through):
 /// 1. Paused or engine inactive → don't suppress.
-/// 2. No game PID configured → don't suppress.
-/// 3. Our own window is foreground → don't suppress (user is configuring).
-/// 4. The game window is foreground → suppress.
-/// 5. Some other app is foreground → don't suppress (the user is somewhere
-///    else; eating their keypress is the bug we are guarding against).
-/// 6. Foreground is UNKNOWN (PID 0 — Niri IPC down, X11 unavailable,
-///    no compositor API) → don't suppress. Macros stay silent rather than
-///    fire into the wrong window. The per-macro `background` flag remains
-///    the explicit opt-in for cross-app behaviour.
-// ── Test-only focus injection ───────────────────────────────────────────
-//
-// The suppression gate normally calls `platform::get_foreground_window()` to
-// ask the OS which window is focused. Under unit tests there is no real
-// compositor, so the platform returns PID 0 (unknown). To exercise the
-// gate without mocking the platform, tests can stash a synthetic PID into
-// `TEST_FOCUSED_PID` (non-zero) before calling `handle_hotkey_key`, and
-// zero it again afterwards.
-#[cfg(test)]
-static TEST_FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
+/// 2. The game is not the focused window → don't suppress. The user is
+///    somewhere else (browser, terminal, Discord, or macrotool's own UI) and
+///    eating their keypress is the bug this gate guards against.
+/// 3. The game IS the focused window → suppress.
+///
+/// `game_in_focus` is published by the game detector, which derives it fresh
+/// from `/proc` by comparing the focused PID's executable basename against
+/// the configured game executable. Unknown focus (no compositor IPC, no X11)
+/// leaves the flag false, so this gate stays closed — macros go quiet rather
+/// than fire into a window we cannot positively identify as the game. There
+/// is deliberately no opt-out: the removed `background` flag was exactly
+/// that opt-out, and it is what allowed misfires into the wrong window.
+///
+/// This function performs no process lookups of its own. It used to call
+/// `get_foreground_window()` and compare the result against a cached game
+/// process id, which wedged permanently once that cached id went stale.
 
 /// One-shot warn so the emergency-stop explanation doesn't spam the log
 /// on every mouse press after Ctrl+Shift+Esc is hit by accident.
 static PAUSED_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 
-fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
+fn should_suppress_hotkey(state: &HookSharedState, _hk: &HotkeyInfo) -> bool {
     if state.paused.load(Ordering::Acquire) {
         if !PAUSED_WARN_EMITTED.swap(true, Ordering::AcqRel) {
             log::warn!(
@@ -464,61 +446,12 @@ fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
         return false;
     }
 
-    let game_pid = state.game_pid.load(Ordering::Acquire);
-    if game_pid == 0 {
-        log::trace!("[input] gate deny: game_pid=0 (no game configured/detected)");
+    if !state.game_in_focus.load(Ordering::Acquire) {
+        log::trace!("[input] gate deny: game_in_focus=false");
         return false;
     }
 
-    let (fg_pid, own_pid): (u32, u32) = {
-        #[cfg(test)]
-        {
-            let injected = TEST_FOCUSED_PID.load(Ordering::Acquire);
-            if injected != 0 {
-                (injected, state.own_pid)
-            } else {
-                let fg = platform::get_foreground_window();
-                let (_, p) = platform::get_window_thread_process_id(fg);
-                (p, state.own_pid)
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let fg = platform::get_foreground_window();
-            let (_, p) = platform::get_window_thread_process_id(fg);
-            (p, state.own_pid)
-        }
-    };
-
-    // Our own window foreground → don't suppress (user is configuring).
-    // Skip this when fg_pid == 0 — the comparator might be returning its
-    // own process ID for a moment, and we don't want that to override the
-    // "unknown focus" deny below.
-    if fg_pid != 0 && fg_pid == own_pid {
-        return false;
-    }
-
-    // Game is foreground → suppress.
-    if fg_pid == game_pid {
-        return true;
-    }
-
-    // Focus is known and is not the game → never suppress. The user is
-    // somewhere else (browser, terminal, Discord) and we must not eat
-    // their keypresses.
-    if fg_pid != 0 {
-        return false;
-    }
-
-    // Focus UNKNOWN (fg_pid == 0): fail CLOSED. The historical fallback
-    // returned `game_alive` here, which silently leaked macros into every
-    // other app on compositors where the platform layer couldn't determine
-    // focus (notably Niri without an explicit IPC call). Macros may stop
-    // firing if our focus source dies — that is strictly safer than firing
-    // them into the wrong window. The dedicated `allow_background` flag on
-    // each macro remains the explicit way to opt into cross-app firing.
-    log::debug!("[input] focus unknown (fg_pid=0); denying suppression");
-    false
+    true
 }
 
 fn should_consume_hotkey_event(
@@ -625,25 +558,28 @@ fn handle_hotkey_key(state: &HookSharedState, key_name: &str, is_down: bool) -> 
 mod tests {
     use super::{
         handle_hotkey_key, should_consume_hotkey_event, HookSharedState, HotkeyInfo, HotkeyMode,
-        Transition, TEST_FOCUSED_PID,
+        Transition,
     };
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
-    /// Helper: every test that touches the suppression gate sets a synthetic
-    /// foreground PID and resets it on drop, so concurrent tests can't
-    /// observe each other's injected focus.
-    struct FocusGuard(u32);
-    impl FocusGuard {
-        fn set(pid: u32) -> Self {
-            TEST_FOCUSED_PID.store(pid, Ordering::Release);
-            FocusGuard(pid)
-        }
+    /// A hook state with one registered `rbutton` hold-hotkey and the engine
+    /// switched on. Focus is left CLOSED — every test opens or closes it
+    /// explicitly via `set_focus`, which is the only input the gate reads.
+    fn armed_state() -> HookSharedState {
+        let state = HookSharedState::new();
+        state.hotkeys.lock().insert(
+            "rbutton".to_string(),
+            Arc::new(HotkeyInfo::new(HotkeyMode::Hold)),
+        );
+        state.engine_active.store(true, Ordering::Release);
+        state
     }
-    impl Drop for FocusGuard {
-        fn drop(&mut self) {
-            TEST_FOCUSED_PID.store(0, Ordering::Release);
-        }
+
+    /// Drive the detector's published verdict directly. The gate reads this
+    /// flag and performs no PID lookup, so tests need no fake compositor.
+    fn set_focus(state: &HookSharedState, focused: bool) {
+        state.game_in_focus.store(focused, Ordering::Release);
     }
 
     #[test]
@@ -657,31 +593,29 @@ mod tests {
         assert!(should_consume_hotkey_event(true, &hotkey, repeat));
     }
 
-    fn armed_state() -> HookSharedState {
-        let state = HookSharedState::new();
-        state.hotkeys.lock().insert(
-            "rbutton".to_string(),
-            Arc::new(HotkeyInfo::new(HotkeyMode::Hold)),
+    #[test]
+    fn game_focused_press_is_consumed_and_arms_the_hotkey() {
+        let state = armed_state();
+        set_focus(&state, true);
+
+        assert!(
+            handle_hotkey_key(&state, "rbutton", true),
+            "a press while the game is focused belongs to us"
         );
-        state.engine_active.store(true, Ordering::Release);
-        state.game_pid.store(42, Ordering::Release);
-        state.game_alive.store(true, Ordering::Release);
-        state
+        assert!(state.hotkeys.lock()["rbutton"].is_active());
     }
 
     #[test]
     fn release_while_gate_closed_still_advances_state_machine() {
         let state = armed_state();
-        let _focus = FocusGuard::set(42); // game focused → gate open
+        set_focus(&state, true);
 
         // Gate open (game focused): press is consumed and activates the hotkey.
         assert!(handle_hotkey_key(&state, "rbutton", true));
         assert!(state.hotkeys.lock()["rbutton"].is_active());
 
         // Gate closes between press and release (focus lost).
-        drop(_focus);
-        let _focus_unknown = FocusGuard::set(0); // unknown focus → gate closed
-        state.game_alive.store(false, Ordering::Release);
+        set_focus(&state, false);
 
         // The release PASSES THROUGH (gate closed, not our event anymore)…
         assert!(!handle_hotkey_key(&state, "rbutton", false));
@@ -690,9 +624,7 @@ mod tests {
 
         // Next press with the gate open starts cleanly instead of being
         // swallowed as "autorepeat" — the old bug made this impossible.
-        drop(_focus_unknown);
-        let _focus = FocusGuard::set(42);
-        state.game_alive.store(true, Ordering::Release);
+        set_focus(&state, true);
         assert!(handle_hotkey_key(&state, "rbutton", true));
         assert!(state.hotkeys.lock()["rbutton"].is_active());
     }
@@ -700,9 +632,8 @@ mod tests {
     #[test]
     fn press_while_gate_closed_does_not_start_a_macro() {
         let state = armed_state();
-        // Gate closed: user is on the desktop — focus is a different PID.
-        let _focus = FocusGuard::set(9999);
-        state.game_alive.store(false, Ordering::Release);
+        // Gate closed: the user is on the desktop, not in the game.
+        set_focus(&state, false);
 
         assert!(!handle_hotkey_key(&state, "rbutton", true));
         assert!(
@@ -712,34 +643,44 @@ mod tests {
     }
 
     #[test]
-    fn unknown_focus_fails_closed_even_when_game_is_alive() {
-        // Regression: under Niri without an explicit IPC call, the platform
-        // layer returned PID 0 for the foreground window. The old gate then
-        // fell back to `game_alive`, so any registered hotkey press was
-        // suppressed and the macro fired — even if the user was typing in
-        // a browser. New contract: unknown focus → no suppression.
+    fn unfocused_game_fails_closed_even_when_the_game_is_running() {
+        // Regression: the gate used to widen itself when the game process was
+        // merely alive — under Niri the platform layer reported focus PID 0,
+        // the old code fell back to "game is alive", and every registered
+        // hotkey press was suppressed and fired the macro even while the user
+        // typed in a browser. New contract: presence never authorises
+        // anything; only focus does.
         let state = armed_state();
-        let _focus = FocusGuard::set(0); // unknown focus
-        state.game_alive.store(true, Ordering::Release);
+        state.game_present.store(true, Ordering::Release);
+        set_focus(&state, false);
 
         assert!(
             !handle_hotkey_key(&state, "rbutton", true),
-            "press with unknown focus must pass through to the focused app"
+            "press must pass through to the focused app when the game is not focused"
         );
         assert!(
             !state.hotkeys.lock()["rbutton"].is_active(),
-            "press with unknown focus must not arm the hotkey"
+            "press must not arm the hotkey when the game is not focused"
         );
     }
 
     #[test]
-    fn own_window_focused_does_not_suppress() {
-        // The user is interacting with macrotool's own UI: hotkeys must
-        // pass through so the QML bindings can react to them. The old
-        // check had `fg_pid != 0` baked in but skipped on the fallback
-        // path; the new check is explicit and survives refactors.
+    fn paused_engine_never_suppresses_even_with_the_game_focused() {
+        // Ctrl+Shift+Esc emergency stop must win over a focused game.
         let state = armed_state();
-        let _focus = FocusGuard::set(state.own_pid);
+        set_focus(&state, true);
+        state.paused.store(true, Ordering::Release);
+
+        assert!(!handle_hotkey_key(&state, "rbutton", true));
+        assert!(!state.hotkeys.lock()["rbutton"].is_active());
+    }
+
+    #[test]
+    fn inactive_engine_never_suppresses_even_with_the_game_focused() {
+        // Toggle key off: the hotkey belongs to the game, untouched.
+        let state = armed_state();
+        set_focus(&state, true);
+        state.engine_active.store(false, Ordering::Release);
 
         assert!(!handle_hotkey_key(&state, "rbutton", true));
         assert!(!state.hotkeys.lock()["rbutton"].is_active());

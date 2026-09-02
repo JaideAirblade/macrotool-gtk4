@@ -163,36 +163,23 @@ fn poll_loop(
                     }
                 }
 
-                // Only fire if the game is actually the foreground window or the user
-                // explicitly enabled background input. Pixel triggers should never fire
-                // while the user is on the desktop.
-                let game_pid = handle.as_ref().map(|h| h.detector.game_pid()).unwrap_or(0);
-                let game_foreground = is_game_foreground(game_pid);
-                let game_hwnd = if game_pid != 0 {
-                    handle
-                        .as_ref()
-                        .map(|h| h.detector.get_cached_hwnd())
-                        .unwrap_or(platform::INVALID_WINDOW_HANDLE)
-                } else {
-                    platform::INVALID_WINDOW_HANDLE
-                };
-                let background = handle
+                // Fire only while the game is actually the focused window.
+                // Pixel triggers must never fire onto the desktop, and the
+                // removed `allowBackground` setting was precisely the escape
+                // hatch that let them.
+                let game_in_focus = handle
                     .as_ref()
-                    .map(|h| h.cfg.settings().allow_background)
+                    .map(|h| h.detector.is_in_focus())
                     .unwrap_or(false);
 
-                if !game_foreground && !background {
+                if !game_in_focus {
                     continue;
                 }
 
                 if !trigger.action_key.is_empty() {
                     if let Some(ref h) = handle {
                         h.input.acquire_sending();
-                        if game_foreground {
-                            platform::send_key(&trigger.action_key);
-                        } else if !game_hwnd.is_null() {
-                            platform::send_key_to_window(game_hwnd, &trigger.action_key);
-                        }
+                        platform::send_key(&trigger.action_key);
                         h.input.release_sending();
                         // Activate buffs for this key
                         check_buffs(&h.cfg, &h.buffs, &trigger.action_key);
@@ -262,16 +249,6 @@ fn parse_color(s: &str) -> u32 {
         .trim_start_matches("0X")
         .trim_start_matches('#');
     u32::from_str_radix(s, 16).unwrap_or(0xFFFFFFFF)
-}
-
-/// Check if the game process is the current foreground window.
-fn is_game_foreground(game_pid: u32) -> bool {
-    if game_pid == 0 {
-        return false;
-    }
-    let fg = platform::get_foreground_window();
-    let (_, fg_pid) = platform::get_window_thread_process_id(fg);
-    fg_pid == game_pid
 }
 
 #[cfg(test)]

@@ -1,38 +1,41 @@
-//! Game Detector — polls the foreground window and detects game process.
+//! Game Detector — answers two questions about the configured game:
+//! is it the focused window, and is it running at all.
 //!
-//! Direct port of the Go `internal/engine/game.go`. Tracks game PID,
-//! foreground state, alive state, and resolves the game window handle for
-//! background input.
+//! Both answers are derived fresh from `/proc` on every tick by comparing
+//! executable basenames (see `platform::focused_window_is_game` and
+//! `platform::find_live_game_exe`). Nothing about the game process is
+//! cached — no process id, no window handle. The old design cached both,
+//! and any drift between that cache and reality
+//! (Wine re-exec, a game that forks its renderer after the splash screen,
+//! xwayland-satellite reassigning the surface) permanently wedged the gate
+//! — the cached PID matched nothing, so no macro fired again until
+//! macrotool restarted.
 
 use crate::config;
 use crate::platform;
-use crate::platform::WindowHandle;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 pub struct GameDetector {
-    window_active: AtomicBool,
-    game_foreground: AtomicBool,
-    game_alive: AtomicBool,
-    game_pid: AtomicU32,
-    cached_game_hwnd: Mutex<u64>, // stored as u64 (0 = invalid)
+    /// The configured game is the live focused window.
+    game_in_focus: AtomicBool,
+    /// A process running the configured game executable exists, whether or
+    /// not it currently holds focus.
+    game_present: AtomicBool,
     prev_active: Mutex<bool>,
-    prev_foreground: Mutex<Option<(bool, bool, u32)>>,
+    prev_foreground: Mutex<Option<(bool, bool)>>,
     active_callbacks: Mutex<Vec<Box<dyn Fn(bool) + Send + Sync>>>,
-    foreground_callbacks: Mutex<Vec<Box<dyn Fn(bool, bool, u32) + Send + Sync>>>,
+    foreground_callbacks: Mutex<Vec<Box<dyn Fn(bool, bool) + Send + Sync>>>,
 }
 
 impl GameDetector {
     pub fn new() -> Self {
         GameDetector {
-            window_active: AtomicBool::new(false),
-            game_foreground: AtomicBool::new(false),
-            game_alive: AtomicBool::new(false),
-            game_pid: AtomicU32::new(0),
-            cached_game_hwnd: Mutex::new(0),
+            game_in_focus: AtomicBool::new(false),
+            game_present: AtomicBool::new(false),
             prev_active: Mutex::new(false),
             prev_foreground: Mutex::new(None),
             active_callbacks: Mutex::new(Vec::new()),
@@ -44,90 +47,27 @@ impl GameDetector {
         self.active_callbacks.lock().push(cb);
     }
 
-    pub fn register_foreground_callback(&self, cb: Box<dyn Fn(bool, bool, u32) + Send + Sync>) {
+    /// Register a `(focused, present)` observer. Fired only on an actual
+    /// state change, never on every tick.
+    pub fn register_foreground_callback(&self, cb: Box<dyn Fn(bool, bool) + Send + Sync>) {
         self.foreground_callbacks.lock().push(cb);
     }
 
-    pub fn is_active(&self, cfg: &config::Manager) -> bool {
-        let s = cfg.settings();
-        if !s.only_in_game {
-            return true;
-        }
-        if s.allow_background && self.game_alive.load(Ordering::Acquire) {
-            return true;
-        }
-        self.window_active.load(Ordering::Acquire)
+    /// Is the configured game the focused window right now?
+    ///
+    /// This is the only gate every injection path consults. It is a plain
+    /// atomic load of the value the last detector tick computed.
+    pub fn is_in_focus(&self) -> bool {
+        self.game_in_focus.load(Ordering::Acquire)
     }
 
-    pub fn is_game_alive(&self) -> bool {
-        self.game_alive.load(Ordering::Acquire)
-    }
-
-    pub fn game_pid(&self) -> u32 {
-        self.game_pid.load(Ordering::Acquire)
-    }
-
-    /// Invalidate the cached game window handle. Called when focus is lost.
-    pub fn invalidate_hwnd_cache(&self) {
-        *self.cached_game_hwnd.lock() = 0;
-    }
-
-    /// Get the cached game window handle, validated with a PID check.
-    pub fn get_cached_hwnd(&self) -> WindowHandle {
-        let pid = self.game_pid();
-        if pid == 0 {
-            return platform::INVALID_WINDOW_HANDLE;
-        }
-
-        // Fast path: check cache
-        let cached = *self.cached_game_hwnd.lock();
-        if cached != 0 {
-            let hwnd = WindowHandle(cached);
-            if platform::is_window_valid(hwnd) {
-                let (_, wpid) = platform::get_window_thread_process_id(hwnd);
-                if wpid == pid {
-                    return hwnd;
-                }
-            }
-        }
-
-        // Slow path: enumerate windows to find the largest visible window for this PID
-        let hwnd = self.find_game_hwnd(pid);
-        *self.cached_game_hwnd.lock() = hwnd.0;
-        hwnd
-    }
-
-    /// Collect all top-level windows for a given PID. Returns the largest visible
-    /// window, or the first visible window if no size info is available.
-    fn find_game_hwnd(&self, pid: u32) -> WindowHandle {
-        let mut best = 0u64;
-        let mut best_area = 0i64;
-        let mut fallback = 0u64;
-
-        let mut visit = |hwnd: WindowHandle| {
-            if fallback == 0 {
-                fallback = hwnd.0;
-            }
-            if let Some(rect) = platform::get_window_rect(hwnd) {
-                let w = (rect.right - rect.left) as i64;
-                let h = (rect.bottom - rect.top) as i64;
-                if w > 0 && h > 0 {
-                    let area = w * h;
-                    if area > best_area {
-                        best_area = area;
-                        best = hwnd.0;
-                    }
-                }
-            }
-        };
-
-        platform::enum_windows_for_pid(pid, &mut visit);
-
-        if best != 0 {
-            WindowHandle(best)
-        } else {
-            WindowHandle(fallback)
-        }
+    /// Is a process running the configured game executable present?
+    ///
+    /// Informational only — used by the overlay to distinguish "game not
+    /// running" from "game running but not focused". It never authorises an
+    /// injection on its own.
+    pub fn is_present(&self) -> bool {
+        self.game_present.load(Ordering::Acquire)
     }
 
     /// Start the detection loop. Spawns two threads:
@@ -147,8 +87,8 @@ impl GameDetector {
         // Event-stream thread: instant focus tracking. Every time Niri
         // emits a focus/window/workspace event we refresh the foreground
         // cache, and (because the event carries the new pid directly) we
-        // also run the matching check_window path inline so game_pid is
-        // updated on the same instant the user clicked.
+        // also run the matching check_window path inline so the focus
+        // booleans are updated on the same instant the user clicked.
         thread::Builder::new()
             .name("game-detect-event".into())
             .spawn(move || {
@@ -255,9 +195,9 @@ impl GameDetector {
                 || t.contains("Window closed")
             {
                 // Drive a full detector tick on the spot. The detector
-                // reads cfg, runs the Wine-cmdline scan, updates
-                // game_pid, and notifies the overlay — all on this
-                // thread, all within a couple of ms.
+                // re-reads cfg, re-derives focus and presence from /proc,
+                // and notifies the overlay — all on this thread, all
+                // within a couple of ms.
                 self.check_window(&cfg);
             }
         }
@@ -287,143 +227,44 @@ impl GameDetector {
         None
     }
 
-    /// Check the foreground window against configured game path.
+    /// Recompute focus/presence from `/proc` and fire edge-triggered
+    /// callbacks.
+    ///
+    /// Both facts are resolved fresh here — this function stores only the
+    /// two booleans it just derived, and never a PID or window handle.
     pub fn check_window(&self, cfg: &config::Manager) {
-        // Refresh the foreground-PID cache once per detector tick. The
-        // hot path (suppression gate, macro send) only reads the cache,
-        // so polling cost is bounded here. Without this refresh the cache
-        // would be frozen at 0 forever and the gate would deny every
-        // macro press.
+        // Refresh the foreground-PID cache once per detector tick. The hot
+        // path (suppression gate, macro send) only reads booleans derived
+        // here, so the polling cost is bounded to this call site. Without
+        // the refresh the cache would sit at 0 forever and the gate would
+        // deny every macro press.
         platform::refresh_foreground_cache();
 
-        let active_game = cfg.active_game();
-        let game_path = cfg.game_path(&active_game).unwrap_or_default();
+        let focused = platform::focused_window_is_game(cfg);
+        // A focused game is by definition present, so only pay for the
+        // /proc walk when the game is NOT the focused window.
+        let present = focused || platform::find_live_game_exe(cfg).is_some();
 
-        // No game selected
-        if active_game.is_empty() || game_path.is_empty() {
-            let old = self.window_active.swap(false, Ordering::AcqRel);
-            self.game_foreground.store(false, Ordering::Release);
-            self.game_pid.store(0, Ordering::Release);
-            if old {
-                self.notify(false);
-            }
-            self.notify_foreground(false);
-            return;
-        }
+        let was_focused = self.game_in_focus.swap(focused, Ordering::AcqRel);
+        self.game_present.store(present, Ordering::Release);
 
-        let fg = platform::get_foreground_window();
-        let (_tid, fg_pid) = platform::get_window_thread_process_id(fg);
-        let own_pid = platform::current_process_id();
-
-        // Our own window counts as "active" for macro firing but is NOT the game
-        // being foreground, so input hooks should not consume global hotkeys.
-        if fg_pid == own_pid {
-            let old = self.window_active.swap(true, Ordering::AcqRel);
-            self.game_foreground.store(false, Ordering::Release);
-            if !old {
-                self.notify(true);
-            }
-            self.notify_foreground(false);
-            return;
-        }
-
-        // Check foreground process path
-        let proc_path = platform::query_process_path(fg_pid);
-        let mut matched = proc_path
-            .as_ref()
-            .map(|p| paths_match(&game_path, p))
-            .unwrap_or(false);
-
-        // Niri + Heroic/Wine/Proton fallback: when the foreground PID is
-        // xwayland-satellite, its own /proc cmdline has nothing useful
-        // (X clients connect via socket, not fork). Walk every /proc entry
-        // looking for a process whose cmdline ends in the configured
-        // Windows .exe. If we find one, treat the foreground window as
-        // the game — the user has the game focused, just via the
-        // satellite wrapper.
-        if !matched {
-            let scan_result = scan_wine_process_for_game(&game_path);
+        // `notify` reports "the engine may act", which under the PID-free
+        // contract is exactly "the game is focused" — there is no longer a
+        // background mode that widens it.
+        if was_focused != focused {
+            self.notify(focused);
+            // One line per transition, on stderr, via the normal logger.
+            // The previous implementation appended to
+            // /tmp/macrotool-detector.log every 5 seconds forever, which is
+            // pure noise in steady state and only ever useful while the
+            // focus bug was being chased.
             log::info!(
-                "[game] scan_wine_process_for_game: game_path={:?} result={:?}",
-                game_path,
-                scan_result
+                "[game] focus transition: game_in_focus={} game_present={}",
+                focused,
+                present
             );
-            if let Some(wine_path) = scan_result {
-                log::info!(
-                    "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {}",
-                    fg_pid,
-                    wine_path
-                );
-                matched = true;
-            }
         }
-
-        // Periodic state log (every ~5s) so the user can see what the
-        // detector is actually seeing. Cheap: a single timestamp check
-        // per 150ms tick. Writes to /tmp/macrotool-detector.log so it's
-        // visible even when macrotool's stderr is /dev/null (launched
-        // from a graphical session).
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static LAST_LOG: AtomicU64 = AtomicU64::new(0);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let last = LAST_LOG.load(Ordering::Acquire);
-            if now_ms.saturating_sub(last) >= 5000 {
-                LAST_LOG.store(now_ms, Ordering::Release);
-                let line = format!(
-                    "[game] ts={} fg_pid={} game_path={:?} proc_path={:?} matched={} own_pid={}\n",
-                    now_ms,
-                    fg_pid,
-                    game_path,
-                    proc_path,
-                    matched,
-                    own_pid
-                );
-                let _ = std::fs::write("/tmp/macrotool-detector.log",
-                    std::fs::read_to_string("/tmp/macrotool-detector.log")
-                        .unwrap_or_default() + &line);
-            }
-        }
-
-        if matched {
-            self.game_pid.store(fg_pid, Ordering::Release);
-            self.game_alive.store(true, Ordering::Release);
-            let old = self.window_active.swap(true, Ordering::AcqRel);
-            let old_fg = self.game_foreground.swap(true, Ordering::AcqRel);
-            if !old {
-                self.notify(true);
-            }
-            if !old_fg {
-                self.notify_foreground(true);
-            }
-        } else {
-            // Check if game process is still alive (even if not foreground)
-            let game_pid = self.game_pid();
-            let alive = if game_pid != 0 {
-                platform::is_process_alive(game_pid)
-            } else {
-                false
-            };
-            self.game_alive.store(alive, Ordering::Release);
-            if !alive {
-                self.game_pid.store(0, Ordering::Release);
-            }
-
-            // Invalidate window handle cache when focus is lost
-            self.invalidate_hwnd_cache();
-
-            let old = self.window_active.swap(false, Ordering::AcqRel);
-            let old_fg = self.game_foreground.swap(false, Ordering::AcqRel);
-            if old {
-                self.notify(false);
-            }
-            if old_fg {
-                self.notify_foreground(false);
-            }
-        }
+        self.notify_foreground(focused, present);
     }
 
     fn notify(&self, active: bool) {
@@ -442,15 +283,13 @@ impl GameDetector {
         }
     }
 
-    fn notify_foreground(&self, focused: bool) {
-        let alive = self.game_alive.load(Ordering::Acquire);
-        let pid = self.game_pid.load(Ordering::Acquire);
-        // Only dispatch on an actual state change — previously the no-game
-        // and own-window paths called this every 150ms tick, spamming the
-        // hub callback (and its log line) 6-7 times a second forever.
+    fn notify_foreground(&self, focused: bool, present: bool) {
+        // Only dispatch on an actual state change — the no-game and
+        // own-window paths used to call this on every tick, spamming the hub
+        // callback (and its log line) several times a second forever.
         {
             let mut prev = self.prev_foreground.lock();
-            let cur = (focused, alive, pid);
+            let cur = (focused, present);
             if *prev == Some(cur) {
                 return;
             }
@@ -458,102 +297,7 @@ impl GameDetector {
         }
         let callbacks = self.foreground_callbacks.lock();
         for cb in callbacks.iter() {
-            cb(focused, alive, pid);
+            cb(focused, present);
         }
     }
-}
-
-/// Compare two file paths case-insensitively. On Wine/Proton the X11
-/// window PID points to the wine process, whose cmdline has a Windows-style
-/// path (Z:\...\\Client.exe) that differs from the configured Linux path
-/// (/home/.../Client.exe). So we compare both the full path AND just the
-/// filename (last path component), which is the most reliable signal.
-fn paths_match(configured: &str, actual: &str) -> bool {
-    let normalize = |s: &str| {
-        s.replace('\\', "/")
-            .to_lowercase()
-            .trim_end_matches('\0')
-            .to_string()
-    };
-    let c = normalize(configured);
-    let a = normalize(actual);
-    if a == c || a.ends_with(&c) || c.ends_with(&a) {
-        return true;
-    }
-    // Fallback: compare just the filename (last path component).
-    let c_file = c.rsplit('/').next().unwrap_or(&c);
-    let a_file = a.rsplit('/').next().unwrap_or(&a);
-    !c_file.is_empty() && c_file == a_file
-}
-
-/// Scan every /proc entry looking for a Wine/Proton game process whose
-/// cmdline ends in the configured Windows .exe. Used as a fallback when
-/// the foreground window's own /proc lookup doesn't yield a useful path
-/// (e.g. Niri's xwayland-satellite wrapper, where X clients connect via
-/// Unix socket rather than forking from the satellite).
-///
-/// Returns the cmdline path of the matching process, or None if no Wine
-/// process carrying the configured exe name is running.
-///
-/// Cost: one readdir on /proc per 150ms detector tick (~few hundred
-/// entries, ~1ms total). Acceptable for a low-frequency poll thread.
-fn scan_wine_process_for_game(configured: &str) -> Option<String> {
-    let configured_basename = std::path::Path::new(configured)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    // Path::file_name() on Unix treats backslashes as literal chars (not
-    // separators), so for a Windows path like "..\bin64\Client.exe" we'd
-    // get the whole string back as the "filename". Normalize by splitting
-    // on both '/' and '\\' ourselves so a Windows exe path matches the
-    // cmdline basename even on Linux.
-    if configured_basename.is_empty() {
-        return None;
-    }
-    let configured_basename = configured_basename
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(&configured_basename)
-        .to_string();
-
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let s = name.to_string_lossy();
-        if !s.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let pid: u32 = match s.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // Never the game if it's us.
-        if pid == platform::current_process_id() {
-            continue;
-        }
-        let cmd_path = std::path::PathBuf::from(format!("/proc/{}/cmdline", pid));
-        let data = match std::fs::read(&cmd_path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        // cmdline is null-separated args. Take the first arg.
-        let first_arg = data
-            .split(|&b| b == 0)
-            .find(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).to_string());
-        let path = match first_arg {
-            Some(p) => p,
-            None => continue,
-        };
-        let lowercase = path.to_ascii_lowercase();
-        let basename = lowercase
-            .rsplit(|c: char| c == '/' || c == '\\')
-            .next()
-            .unwrap_or(&lowercase)
-            .to_string();
-        if basename == configured_basename {
-            return Some(path);
-        }
-    }
-    None
 }

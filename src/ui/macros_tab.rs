@@ -141,7 +141,6 @@ fn add_macro(cfg: &Arc<crate::config::Manager>) {
             inter_key_delay: 0,
             enabled: true,
             max_hold_duration: 0,
-            background: false,
         });
     });
 }
@@ -309,22 +308,6 @@ fn make_macro_card(
     }
     en_box.append(&en_sw);
     toggles.append(&en_box);
-
-    let bg_box = GtkBox::new(Orientation::Horizontal, 8);
-    bg_box.append(&Label::new(Some("Background")));
-    let bg_sw = Switch::new();
-    bg_sw.set_active(m.background);
-    {
-        let cfg = cfg.clone();
-        let engine = engine.clone();
-        bg_sw.connect_state_set(move |_, state| {
-            update_macro(&cfg, idx, |m| m.background = state);
-            engine.reload_profile();
-            glib::Propagation::Proceed
-        });
-    }
-    bg_box.append(&bg_sw);
-    toggles.append(&bg_box);
     card.append(&toggles);
 
     // ── Keys list ──

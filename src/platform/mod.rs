@@ -6,9 +6,8 @@
 //!   - `grim` installed for screen capture (wlroots-based compositors)
 //!
 //! The implementation intentionally does not depend on a specific Wayland
-//! compositor protocol for focus detection; it uses /proc-based process
-//! matching and lets the user enable `allowBackground` if focus detection is
-//! not perfect.
+//! compositor protocol for focus detection; it uses /proc-based executable
+//! basenames and is fail-closed when focus or the game process is unknown.
 
 pub mod linux;
 pub use linux::*;

@@ -15,8 +15,8 @@ ShellRoot {
         macros: [],
         buffs: [],
         gameActive: false,
-        gameAlive: false,
-        gamePid: 0,
+        gamePresent: false,
+        gameInFocus: false,
         overlayPosition: "top-left"
     })
     property bool stateLoaded: false
@@ -28,9 +28,15 @@ ShellRoot {
     function updateGameTagVisibility(source) {
         try {
             const clients = JSON.parse(source).clients || [];
-            const gamePid = Number(root.state.gamePid || 0);
-            gameVisibleOnActiveTag = gamePid > 0 && clients.some(client =>
-                Number(client.pid) === gamePid && client.is_visible === true);
+            // Macrotool no longer publishes a game process id: the detector
+            // answers "is the game focused" directly, fresh from /proc, so
+            // there is no pid to match clients against (and no stale pid to
+            // wedge this binding). The compositor query is still consulted to
+            // confirm a client is actually mapped on the active tag before we
+            // put a layer-shell surface over it.
+            const focused = root.state.gameInFocus ?? false;
+            gameVisibleOnActiveTag = focused && clients.some(client =>
+                client.is_visible === true);
         } catch (error) {
             // Keep the last confirmed state while an IPC request is in flight.
             // Clearing it before every successful reply caused visible flicker.
@@ -311,7 +317,7 @@ ShellRoot {
 
                 Text {
                     visible: root.state.activeGame && !root.state.gameActive
-                    text: root.state.gameAlive ? "Game not focused (background)" : "Game not running"
+                    text: root.state.gamePresent ? "Game not focused" : "Game not running"
                     color: root.windowTextColor
                     opacity: 0.68
                     font.pixelSize: 10

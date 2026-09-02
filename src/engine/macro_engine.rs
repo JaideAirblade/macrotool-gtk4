@@ -1,8 +1,10 @@
 //! Macro Engine — manages macro hotkeys and execution.
 //!
-//! Supports press / hold / toggle modes with background input dispatch.
-//! Background macros inject globally via uinput; foreground macros use
-//! uinput only when the game process is the live foreground window.
+//! Supports press / hold / toggle modes. Keys are injected via uinput if and
+//! only if the configured game is the live focused window, as reported by the
+//! detector's fresh `/proc` basename comparison. There is no background mode:
+//! injecting into a window we cannot positively identify as the game is the
+//! misfire this design removes.
 
 use crate::config::{self, Macro};
 use crate::engine::game::GameDetector;
@@ -101,7 +103,6 @@ impl MacroEngine {
             }
             let mode = input::parse_mode(&m.mode);
             self.handle.input.register_hotkey(&hk, mode);
-            self.handle.input.set_background(&hk, m.background);
             self.handle.input.set_enabled(&hk, m.enabled);
             profile.insert(hk.clone(), m);
             running.insert(hk, Arc::new(AtomicBool::new(false)));
@@ -147,7 +148,7 @@ impl MacroEngine {
                     // Toggle ON: state machine flipped Idle→Holding.
                     // Just start the macro. The turn-off is handled by
                     // Transition::Stop (Holding→Idle), which makes hold_loop
-                    // exit via the is_active() check.
+                    // exit via the detector.is_in_focus() check.
                     start_macro(handle.clone(), hk.clone(), m, running_map.clone());
                 }
                 input::Transition::None => {}
@@ -185,10 +186,9 @@ fn start_macro(
     if m.mode == "press" {
         let h = handle.clone();
         let flag_clone = running_flag.clone();
-        let bg = m.background;
         thread::spawn(move || {
             h.input.acquire_sending();
-            send_key_sequence(&m.keys, m.inter_key_delay, &flag_clone, &h, bg);
+            send_key_sequence(&m.keys, m.inter_key_delay, &flag_clone, &h);
             h.input.release_sending();
             // Clear running flag when done
             flag_clone.store(false, Ordering::Release);
@@ -263,21 +263,21 @@ fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHan
             break;
         }
 
-        // Check engine-active / game focus. Foreground macros stop when the engine
-        // is paused; background macros keep firing so long as the user hasn't paused.
-        if !m.background
-            && !handle
-                .input
-                .shared_state()
-                .engine_active
-                .load(Ordering::Acquire)
+        // Check engine-active. Every macro stops when the engine is switched
+        // off — the removed `background` flag used to exempt itself from this
+        // check and keep firing into whatever window happened to be focused.
+        if !handle
+            .input
+            .shared_state()
+            .engine_active
+            .load(Ordering::Acquire)
         {
             break;
         }
 
         // Send keys
         handle.input.acquire_sending();
-        send_key_sequence(&keys, ikd, &stop_flag, &handle, m.background);
+        send_key_sequence(&keys, ikd, &stop_flag, &handle);
         handle.input.release_sending();
 
         if let Some(max_duration) = max_duration {
@@ -306,25 +306,20 @@ fn hold_loop(hk: String, m: Macro, stop_flag: Arc<AtomicBool>, handle: EngineHan
     }
 }
 
-/// Send a sequence of keys using the correct delivery strategy:
-/// - background=true  → inject globally via uinput (no focus steal)
-/// - background=false → uinput only if game is foreground, else DROP
+/// Send a sequence of keys.
+///
+/// Delivery is unconditional in form (always uinput) and conditional in
+/// permission: a key is injected only while the configured game is the live
+/// focused window. Focus is re-checked per key rather than once per sequence,
+/// so alt-tabbing mid-sequence stops the remaining keys instead of spraying
+/// them into whatever the user switched to.
 fn send_key_sequence(
     keys: &[String],
     ikd: i32,
     stop_flag: &AtomicBool,
     handle: &EngineHandle,
-    background: bool,
 ) {
     let detector = &handle.detector;
-
-    // Resolve game state once per sequence
-    let game_pid = detector.game_pid();
-    let game_hwnd = if game_pid != 0 {
-        detector.get_cached_hwnd()
-    } else {
-        platform::INVALID_WINDOW_HANDLE
-    };
 
     for (i, key) in keys.iter().enumerate() {
         // stop_flag is the running flag: false = stop requested
@@ -335,34 +330,14 @@ fn send_key_sequence(
             platform::precise_sleep(ikd as f64);
         }
 
-        // The macro's background flag is AUTHORITATIVE:
-        // - background=true  → always inject globally via uinput
-        // - background=false → uinput only if game is foreground, else DROP
-        if background {
-            if !game_hwnd.is_null() {
-                log::debug!("[macro] sending background key {} direct", key);
-                platform::send_key_to_window(game_hwnd, key);
-            } else {
-                log::debug!("[macro] background key {} dropped, no hwnd", key);
-            }
+        // Inject only while the game is CURRENTLY focused. The detector
+        // re-derives this from /proc, so a lost tick simply drops one key;
+        // the held hotkey retries on the next interval.
+        if detector.is_in_focus() {
+            log::debug!("[macro] sending key {} (game focused)", key);
+            platform::send_key(key);
         } else {
-            // Non-background macro: inject via uinput only if the game is
-            // CURRENTLY the focused window. We previously OR'd `game_alive`
-            // here to tolerate 150ms focus flickers, but that fallback also
-            // matched "game running in the background, user is in browser"
-            // and injected keys into the wrong app. The detector re-checks
-            // focus every 150ms, so dropping on a single tick is acceptable;
-            // any real focused game frame will pick the key up on the next
-            // tick (the macro holds the hotkey, so the next press retries).
-            let game_foreground = is_game_foreground(game_pid);
-            log::debug!("[macro] foreground key {} game_foreground={}", key, game_foreground);
-            if game_foreground {
-                log::debug!("[macro] sending foreground key {} direct", key);
-                platform::send_key(key);
-            }
-            // else: focus is unknown, or some other app is focused — drop
-            // the key. We never inject into a window we can't positively
-            // identify as the game.
+            log::debug!("[macro] dropping key {} (game not focused)", key);
         }
 
         // Activate buff timers for this key
@@ -382,24 +357,6 @@ fn check_buffs(cfg: &config::Manager, buffs: &crate::engine::buff::BuffEngine, k
             buffs.activate(b.clone());
         }
     }
-}
-
-/// Check if the game process is the current foreground window.
-///
-/// "Unknown" focus (returns PID 0 from the platform layer, e.g. when no
-/// compositor IPC is reachable) is treated as NOT foreground. The old
-/// implementation OR'd `game_alive` here, which caused macros to inject
-/// into whichever app actually had focus whenever the game was running
-/// but the user wasn't in it. Pair with the matching fix in `input.rs`.
-pub(crate) fn is_game_foreground(game_pid: u32) -> bool {
-    if game_pid == 0 {
-        return false;
-    }
-    let fg = platform::get_foreground_window();
-    let (_, fg_pid) = platform::get_window_thread_process_id(fg);
-    // Strict match: require a positive foreground-PID that equals the
-    // game's PID. Unknown focus → false → caller drops the key.
-    fg_pid != 0 && fg_pid == game_pid
 }
 
 #[cfg(test)]

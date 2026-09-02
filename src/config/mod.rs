@@ -37,8 +37,6 @@ pub struct Macro {
     pub enabled: bool,
     #[serde(rename = "maxHoldDuration", default)]
     pub max_hold_duration: i32,
-    #[serde(default)]
-    pub background: bool,
 }
 
 impl Default for Macro {
@@ -53,7 +51,6 @@ impl Default for Macro {
             inter_key_delay: 0,
             enabled: true,
             max_hold_duration: 0,
-            background: false,
         }
     }
 }
@@ -218,8 +215,6 @@ pub struct Settings {
     pub auto_detect_game: bool,
     #[serde(rename = "onlyInGame", default = "default_true")]
     pub only_in_game: bool,
-    #[serde(rename = "allowBackground", default)]
-    pub allow_background: bool,
     #[serde(rename = "minimizeToTray", default)]
     pub minimize_to_tray: bool,
     #[serde(default = "default_true")]
@@ -240,7 +235,6 @@ impl Default for Settings {
             default_delay: 50,
             auto_detect_game: false,
             only_in_game: true,
-            allow_background: false,
             minimize_to_tray: false,
             dark_mode: true,
             toggle_key: "ScrollLock".into(),
@@ -547,6 +541,42 @@ impl Manager {
             .get(game_name)
             .map(|g| g.path.clone())
     }
+
+    /// Test fixture: a manager with no active game selected.
+    ///
+    /// The PID-free detector in `platform::linux` must fail closed when the
+    /// user has not picked a game, and that path is worth asserting without
+    /// touching the real config file on disk.
+    #[cfg(test)]
+    pub fn default_for_tests_empty_active() -> Self {
+        let manager = Manager::new();
+        {
+            let mut inner = manager.inner.write();
+            inner.tree = ConfigTree::default();
+            inner.persistence_blocked = true;
+        }
+        manager
+    }
+
+    /// Test fixture: a manager with `game` selected and registered at
+    /// `path`. Pass an empty `path` to exercise the "configured game has no
+    /// executable path" branch of the detector.
+    #[cfg(test)]
+    pub fn default_for_tests_with_active_game(game: &str, path: &str) -> Self {
+        let manager = Manager::default_for_tests_empty_active();
+        {
+            let mut inner = manager.inner.write();
+            inner.tree.active_game = game.to_string();
+            inner.tree.games.insert(
+                game.to_string(),
+                Game {
+                    path: path.to_string(),
+                    classes: BTreeMap::new(),
+                },
+            );
+        }
+        manager
+    }
 }
 
 fn get_spec(tree: &ConfigTree) -> Option<&Spec> {
@@ -587,12 +617,51 @@ fn parse_doc(doc: &Document, tree: &mut ConfigTree) {
     }
 }
 
+/// The `allowBackground` setting and the per-macro `background` flag were
+/// removed: "background" input meant injecting keys into a window we could
+/// not positively identify as the game, which is exactly the misfire the
+/// PID-free detector exists to prevent. Keys are now sent if and only if the
+/// game is the live focused window.
+///
+/// Old config files still carry the properties. Rather than fail the load,
+/// note the removal once and ignore the value (i.e. treat it as `false`).
+fn warn_once_on_removed_background_setting(node: &Node) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !node.props.iter().any(|(k, _)| k == "allowBackground") {
+        return;
+    }
+    if !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        log::warn!(
+            "[config] `settings allowBackground=` is no longer supported and is being ignored. \
+             Macros now fire only while the configured game is the focused window; the setting \
+             will disappear from config.kdl on the next save."
+        );
+    }
+}
+
+/// Companion to `warn_once_on_removed_background_setting` for the per-macro
+/// `background` property. Same reasoning, same treatment: ignored, treated
+/// as `false`, mentioned once.
+fn warn_once_on_removed_macro_background(node: &Node) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !node.props.iter().any(|(k, _)| k == "background") {
+        return;
+    }
+    if !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        log::warn!(
+            "[config] per-macro `background=` is no longer supported and is being ignored. \
+             Macros now fire only while the configured game is the focused window; the property \
+             will disappear from config.kdl on the next save."
+        );
+    }
+}
+
 fn parse_settings(node: &Node, tree: &mut ConfigTree) {
     let s = &mut tree.settings;
     s.default_delay = node.prop_int("defaultDelay", s.default_delay.into()) as i32;
     s.auto_detect_game = node.prop_bool("autoDetectGame", s.auto_detect_game);
     s.only_in_game = node.prop_bool("onlyInGame", s.only_in_game);
-    s.allow_background = node.prop_bool("allowBackground", s.allow_background);
+    warn_once_on_removed_background_setting(node);
     s.minimize_to_tray = node.prop_bool("minimizeToTray", s.minimize_to_tray);
     s.dark_mode = node.prop_bool("darkMode", s.dark_mode);
     s.toggle_key = node.prop_str("toggleKey", &s.toggle_key.clone());
@@ -665,6 +734,7 @@ fn parse_macro(node: &Node, default_delay: i32) -> Macro {
         .collect();
 
     let hold_mode = node.prop_bool("holdMode", false);
+    warn_once_on_removed_macro_background(node);
     let mode = {
         let m = node.prop_str("mode", "");
         if m.is_empty() {
@@ -688,7 +758,6 @@ fn parse_macro(node: &Node, default_delay: i32) -> Macro {
         inter_key_delay: node.prop_int("interKeyDelay", 0) as i32,
         enabled: node.prop_bool("enabled", true),
         max_hold_duration: node.prop_int("maxHoldDuration", 0) as i32,
-        background: node.prop_bool("background", false),
     }
 }
 
@@ -824,7 +893,6 @@ fn build_doc(tree: &ConfigTree) -> Document {
     s_node.set_int("defaultDelay", s.default_delay as i64);
     s_node.set_bool("autoDetectGame", s.auto_detect_game);
     s_node.set_bool("onlyInGame", s.only_in_game);
-    s_node.set_bool("allowBackground", s.allow_background);
     s_node.set_bool("minimizeToTray", s.minimize_to_tray);
     s_node.set_bool("darkMode", s.dark_mode);
     s_node.set_str("toggleKey", &s.toggle_key);
@@ -883,7 +951,6 @@ fn build_doc(tree: &ConfigTree) -> Document {
                     m_node.set_int("interKeyDelay", m.inter_key_delay as i64);
                     m_node.set_bool("enabled", m.enabled);
                     m_node.set_int("maxHoldDuration", m.max_hold_duration as i64);
-                    m_node.set_bool("background", m.background);
                     for k in &m.keys {
                         let mut kn = Node::new("key");
                         kn.args.push(Value::Str(k.clone()));
