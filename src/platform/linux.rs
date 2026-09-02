@@ -1803,10 +1803,20 @@ fn exe_basename_matches(pid: u32, want_basename: &str) -> bool {
 
 /// Is the currently focused window owned by the configured game?
 ///
-/// Fresh per call — nothing is cached. Returns false when no game is
-/// configured, when the configured game has no path, when focus is unknown
-/// (PID 0 — Niri IPC down, no X11), when our own window is focused, or when
-/// the focused process's exe basename is not the game's.
+/// Fresh per call — nothing about the game itself is cached. Returns false
+/// when no game is configured, when the configured game has no path, when
+/// focus is unknown (PID 0 — Niri event-stream silent, no subscriber, no
+/// X11), when our own window is focused, or when the focused process's exe
+/// basename is not the game's.
+///
+/// The focused PID is read from `CACHED_FOCUSED_PID`, which the
+/// `game-detect-event` subscriber thread populates directly from Niri's
+/// `event-stream` JSON (`WindowsChanged.windows[*].pid` for the window with
+/// `is_focused:true`) — bypassing the per-event `niri msg -j
+/// focused-window` fork. The previous implementation called
+/// `get_foreground_window()` + `get_window_thread_process_id()` (Win32
+/// APIs) which always returned PID 0 on Niri Wayland, so the gate was
+/// permanently closed on uwU.
 pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
     let active = cfg.active_game();
     if active.is_empty() {
@@ -1824,12 +1834,34 @@ pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
         return false;
     }
 
-    let hwnd = get_foreground_window();
-    let (_tid, pid) = get_window_thread_process_id(hwnd);
+    // Read the focused PID directly from the platform cache. The cache is
+    // populated by the Niri event-stream subscriber (see
+    // `crate::engine::game::run_event_stream_iteration`) which parses
+    // `WindowsChanged` events for `is_focused:true` and stores the
+    // matching window's `pid` field. Bypassing `get_foreground_window()`
+    // + `get_window_thread_process_id()` is required because those Win32
+    // shims return 0 on Niri Wayland.
+    let pid = CACHED_FOCUSED_PID.load(Ordering::Acquire);
     if pid == 0 || pid == current_process_id() {
         return false;
     }
     exe_basename_matches(pid, &want)
+}
+
+/// Update the cached focused PID from the Niri event-stream JSON payload.
+///
+/// Called by `crate::engine::game::run_event_stream_iteration` whenever a
+/// `WindowsChanged` (or `WindowFocusChanged`) event arrives. The event
+/// payload carries the focused window's `pid` directly, so we can keep
+/// `CACHED_FOCUSED_PID` fresh without forking `niri msg -j
+/// focused-window` on every keystroke. Pass `None` to clear the cache
+/// (e.g. when no window is focused).
+pub fn set_focused_pid_from_event(pid: Option<u32>) {
+    let new = pid.unwrap_or(0);
+    let prev = CACHED_FOCUSED_PID.swap(new, Ordering::AcqRel);
+    if prev != new {
+        log::debug!("[linux] event-stream focus -> {} (was {})", new, prev);
+    }
 }
 
 /// Find a live process whose executable basename matches the configured

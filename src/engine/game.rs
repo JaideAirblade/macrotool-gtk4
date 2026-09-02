@@ -184,7 +184,11 @@ impl GameDetector {
             }
             // Cheap event filter. The full event-stream emits one JSON
             // object per line. We only react to lines that mention focus
-            // or windows — workspace-only changes don't affect us.
+            // or windows — workspace-only changes don't affect us. When
+            // the event carries a WindowsChanged / WindowFocusChanged
+            // payload we extract the focused window's pid INLINE (no
+            // fork) so `focused_window_is_game` has a fresh pid without
+            // round-tripping through `niri msg -j focused-window`.
             let t = line.trim();
             if t.is_empty() {
                 continue;
@@ -194,6 +198,21 @@ impl GameDetector {
                 || t.contains("Window opened")
                 || t.contains("Window closed")
             {
+                // Parse the JSON event and find the focused window's
+                // pid. `WindowsChanged` is the dominant case (emitted on
+                // every focus change, window create, and window close).
+                // Its payload shape is
+                //   {"WindowsChanged":{"windows":[
+                //     {"id":N,"pid":<u32>,"is_focused":bool,...},
+                //     ...
+                //   ]}}
+                // `WindowFocusChanged` is just `{"WindowFocusChanged":
+                // {"id":N}}` — we resolve the pid from the same
+                // WindowsChanged snapshot that Niri emits on focus
+                // changes anyway, so we treat it identically.
+                if let Some(pid) = parse_niri_event_focused_pid(&line) {
+                    crate::platform::set_focused_pid_from_event(Some(pid));
+                }
                 // Drive a full detector tick on the spot. The detector
                 // re-reads cfg, re-derives focus and presence from /proc,
                 // and notifies the overlay — all on this thread, all
@@ -206,6 +225,8 @@ impl GameDetector {
     /// Locate the live Niri IPC socket. Honours `$NIRI_SOCKET` first;
     /// falls back to scanning `/run/user/$UID/` for a working socket
     /// (skipping stale symlinks whose target has been deleted).
+
+
     fn find_niri_socket(&self) -> Option<String> {
         if let Ok(p) = std::env::var("NIRI_SOCKET") {
             if !p.is_empty() && std::path::Path::new(&p).exists() {
@@ -299,5 +320,102 @@ impl GameDetector {
         for cb in callbacks.iter() {
             cb(focused, present);
         }
+    }
+}
+
+/// Parse the focused window's pid out of a single Niri event-stream JSON
+/// line. Returns the first window with `is_focused:true` whose `pid` is
+/// non-zero. Returns `None` for unrelated events, parse failures, or
+/// focus-state-only events that carry no pid.
+///
+/// Cheap: runs synchronously on the event-stream subscriber thread, never
+/// forks, never blocks on /proc. The poll thread re-derives everything via
+/// `/proc` for the heavier "is this process the game" question.
+fn parse_niri_event_focused_pid(line: &str) -> Option<u32> {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let obj = v.as_object()?;
+    // WindowsChanged is the primary focus-tracking event. Niri emits it
+    // on every window create / close / focus transition, and the payload
+    // carries the full pid per window. Find the window whose
+    // `is_focused:true` and read its pid.
+    if let Some(wc) = obj.get("WindowsChanged").and_then(|x| x.as_object()) {
+        if let Some(windows) = wc.get("windows").and_then(|x| x.as_array()) {
+            for w in windows {
+                let focused = w
+                    .get("is_focused")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                if !focused {
+                    continue;
+                }
+                if let Some(pid) = w.get("pid").and_then(|x| x.as_u64()) {
+                    if pid != 0 && pid <= u32::MAX as u64 {
+                        return Some(pid as u32);
+                    }
+                }
+            }
+        }
+        // WindowsChanged with no focused window: clear the cache.
+        return None;
+    }
+    None
+}
+
+
+#[cfg(test)]
+mod parse_niri_event_tests {
+    use super::parse_niri_event_focused_pid;
+
+    /// The real Niri `WindowsChanged` payload shape — every window has
+    /// `id`, `pid`, `is_focused`, etc. The focused window's pid must be
+    /// returned even when other windows in the same event are not
+    /// focused.
+    #[test]
+    fn extracts_focused_pid_from_a_real_windows_changed_payload() {
+        let line = r#"{"WindowsChanged":{"windows":[{"id":42,"title":"Macrotool","app_id":"com.jaide.macrotool","pid":2744065,"workspace_id":1,"is_focused":true,"is_floating":false,"is_urgent":false},{"id":77,"title":"hermes","app_id":"com.mitchellh.ghostty","pid":1836845,"workspace_id":1,"is_focused":false,"is_floating":false,"is_urgent":false}]}}"#;
+        assert_eq!(parse_niri_event_focused_pid(line), Some(2744065));
+    }
+
+    /// When a WindowsChanged event arrives but no window is focused
+    /// (focus moved to the desktop, or the compositor's own surface),
+    /// the helper must return None so the platform cache clears.
+    #[test]
+    fn returns_none_when_no_window_is_focused() {
+        let line = r#"{"WindowsChanged":{"windows":[{"id":42,"title":"Macrotool","app_id":"com.jaide.macrotool","pid":2744065,"workspace_id":1,"is_focused":false,"is_floating":false,"is_urgent":false}]}}"#;
+        assert_eq!(parse_niri_event_focused_pid(line), None);
+    }
+
+    /// Unrelated events (WorkspacesChanged, ConfigLoaded, KeyboardLayouts
+    /// Changed) must return None — they don't carry a focused pid.
+    #[test]
+    fn returns_none_for_unrelated_events() {
+        let line = r#"{"WorkspacesChanged":{"workspaces":[]}}"#;
+        assert_eq!(parse_niri_event_focused_pid(line), None);
+
+        let line = r#"{"ConfigLoaded":{"failed":false}}"#;
+        assert_eq!(parse_niri_event_focused_pid(line), None);
+    }
+
+    /// Malformed JSON must return None, not panic. The subscriber thread
+    /// runs continuously and a corrupt line must not kill the process.
+    #[test]
+    fn returns_none_for_malformed_json() {
+        assert_eq!(parse_niri_event_focused_pid("not json at all"), None);
+        assert_eq!(parse_niri_event_focused_pid(""), None);
+        assert_eq!(
+            parse_niri_event_focused_pid(r#"{"WindowsChanged":"oops"}"#),
+            None
+        );
+    }
+
+    /// The focused window must have a non-zero pid (the `pid:0` case is
+    /// niri's sentinel for "no process"; treat it like no-focus).
+    #[test]
+    fn focused_window_with_zero_pid_is_ignored() {
+        let line = r#"{"WindowsChanged":{"windows":[{"id":42,"title":"Compositor","app_id":null,"pid":0,"workspace_id":null,"is_focused":true,"is_floating":false,"is_urgent":false}]}}"#;
+        assert_eq!(parse_niri_event_focused_pid(line), None);
     }
 }
