@@ -934,6 +934,161 @@ fn parse_niri_focused_window(stdout: &[u8]) -> Option<u32> {
         .map(|p| p as u32)
 }
 
+/// Same JSON shape as `parse_niri_focused_window`, but also extracts the
+/// composer's authoritative `title` and `app_id` for the focused window.
+/// Used as a last-resort fallback for X11 games whose PID points at
+/// xwayland-satellite — the satellite's /proc tree contains no
+/// descendants of the actual game, but Niri knows the focused window's
+/// real title (e.g. "Shattered Empire") and `app_id` (e.g.
+/// "steam_app_default").
+#[derive(Clone, Debug)]
+struct NiriFocusSnapshot {
+    pid: u32,
+    title: Option<String>,
+    app_id: Option<String>,
+}
+
+fn parse_niri_focused_identity(stdout: &[u8]) -> Option<NiriFocusSnapshot> {
+    let json = serde_json::from_slice::<serde_json::Value>(stdout).ok()?;
+    let pid = json
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .filter(|&p| p != 0)
+        .map(|p| p as u32)?;
+    let title = json
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app_id = json
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some(NiriFocusSnapshot { pid, title, app_id })
+}
+
+/// Throttled wrapper around `niri msg -j focused-window`. Returns the
+/// most recent parsed snapshot if it is <500ms old, otherwise re-runs
+/// `niri msg` (with the same hard-timeout guard as
+/// `niri_foreground_pid`) and refreshes the cache. On subprocess failure
+/// the stale cache is preserved so a transient Niri hiccup doesn't
+/// briefly gate the macros closed.
+///
+/// Throttle rationale: `focused_window_is_game` may be polled every
+/// ~150ms by the detector loop, and on every key event by the
+/// `should_suppress_hotkey` hot path. Without throttling, this would
+/// fork `niri msg` ~7x/sec indefinitely — measurably expensive and
+/// racy. 500ms is well above the detector poll period (so we always
+/// return a value < 1 poll old) but keeps fork+exec cost negligible.
+fn niri_foreground_identity_with_throttle() -> Option<NiriFocusSnapshot> {
+    const TTL: Duration = Duration::from_millis(500);
+    static CACHE: Lazy<Mutex<Option<(Instant, Option<NiriFocusSnapshot>)>>> =
+        Lazy::new(|| Mutex::new(None));
+
+    {
+        let guard = CACHE.lock();
+        if let Some((at, ref snap)) = *guard {
+            if at.elapsed() < TTL {
+                return snap.clone();
+            }
+        }
+    }
+
+    // Cache miss or stale — run a fresh `niri msg`. We deliberately do
+    // NOT mutate the cache on failure paths here; the existing guard
+    // preserves the previous value, which is the correct behaviour
+    // (Niri hiccup → keep returning the last known good identity, even
+    // if slightly stale, rather than flipping to None mid-game).
+    let fresh = niri_foreground_identity_inner();
+    let mut guard = CACHE.lock();
+    // Only update the timestamp on a fresh SUCCESS; on None we leave
+    // the old snapshot and its timestamp untouched so the next call
+    // within TTL still gets the cached value.
+    if fresh.is_some() {
+        *guard = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+/// Inner (unthrottled) runner for `niri msg -j focused-window` that
+/// returns the full title/app_id snapshot. Uses the same 100ms hard
+/// timeout as `niri_foreground_pid` so a hung Niri can't stall the
+/// detector thread.
+fn niri_foreground_identity_inner() -> Option<NiriFocusSnapshot> {
+    let socket = niri_socket_path()?;
+    if !socket.exists() {
+        return None;
+    }
+
+    let mut child = Command::new("niri")
+        .args(["msg", "-j", "focused-window"])
+        .env("NIRI_SOCKET", &socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_millis(100);
+
+    let mut stdout_handle = child.stdout.take();
+    let mut stderr_handle = child.stderr.take();
+    let drain_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        fn drain<R: Read>(mut s: R) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            out
+        }
+        let stdout = stdout_handle.take().map(drain);
+        let stderr = stderr_handle.take().map(drain);
+        (stdout.unwrap_or_default(), stderr.unwrap_or_default())
+    });
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let (stdout_bytes, _stderr_bytes) =
+                    drain_thread.join().unwrap_or_default();
+                let _ = child.wait();
+                if !status.success() {
+                    log::trace!(
+                        "[linux] niri msg -j focused-window (identity) failed: status={:?}",
+                        status.code()
+                    );
+                    return None;
+                }
+                return parse_niri_focused_identity(&stdout_bytes);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    log::warn!(
+                        "[linux] niri msg (identity) timed out after {:?} — killing stuck subprocess",
+                        timeout
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = drain_thread.join();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = drain_thread.join();
+                return None;
+            }
+        }
+    }
+}
+
 /// Locate the Niri IPC socket. Honour `$NIRI_SOCKET` first (set by the
 /// compositor when launching child processes), then fall back to scanning
 /// `/run/user/<uid>/` for a `niri.wayland-1.*.sock` file.
@@ -1842,10 +1997,155 @@ pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
     // + `get_window_thread_process_id()` is required because those Win32
     // shims return 0 on Niri Wayland.
     let pid = CACHED_FOCUSED_PID.load(Ordering::Acquire);
+    eprintln!("[DEBUG-DIAG.focused] active={} want={} niri_cached_pid={} own={}", active, want, pid, current_process_id());
     if pid == 0 || pid == current_process_id() {
         return false;
     }
-    exe_basename_matches(pid, &want)
+    let m = exe_basename_matches(pid, &want);
+    eprintln!("[DEBUG-DIAG.focused] exe_basename_matches(pid={}, want={}) -> {}", pid, want, m);
+    if m {
+        return true;
+    }
+
+    // Recursive descendant walk (max depth 4). Wine/Proton trees under
+    // xwayland-satellite (the focused PID for X11 games on Niri Wayland)
+    // can be several levels deep (xwayland-satellite → Xwayland → … →
+    // Client.exe), so a single-level child walk misses Client.exe and
+    // `focused_window_is_game` permanently returns false for SEBNS. We
+    // walk up to 4 generations of descendants, calling
+    // `exe_basename_matches` on each, and short-circuit on the first hit.
+    if walk_descendants_for_match(pid, &want, 4) {
+        return true;
+    }
+
+    // Final fallback: scan the focused PID's `/proc/<pid>/cmdline` for
+    // ANY arg whose basename ends in `.exe` and matches (or contains) the
+    // wanted game basename. Some Wine/Proton invocations bury the game
+    // .exe path in argv[0] or argv[1] rather than as the last argument,
+    // which the existing `cmdline_has_exe_basename` (last-`.exe`-arg
+    // only) misses.
+    if let Ok(data) = std::fs::read(proc_pid_path(pid, "cmdline")) {
+        for arg in data.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let s = String::from_utf8_lossy(arg);
+            let basename = path_basename_ci(&s);
+            if basename.is_empty() {
+                continue;
+            }
+            let lowered = basename.to_ascii_lowercase();
+            if !lowered.ends_with(".exe") {
+                continue;
+            }
+            let hit = basename == want
+                || basename.contains(&want)
+                || want.contains(&basename);
+            eprintln!(
+                "[DEBUG-DIAG.focused] cmdline_arg_match(pid={}, arg_basename={}, want={}) -> {}",
+                pid, basename, want, hit
+            );
+            if hit {
+                return true;
+            }
+        }
+    }
+
+    // Final fallback: ask Niri directly for the focused window's title /
+    // app_id. The event-stream subscriber (`set_focused_pid_from_event`)
+    // only updates `CACHED_FOCUSED_PID` with the pid — but for X11 games
+    // running through xwayland-satellite, that pid is the satellite
+    // itself and its `/proc` tree does NOT contain the Wine/Proton
+    // `client.exe` (X11 clients connect to the satellite via socket, so
+    // they never appear as descendants of the satellite PID). Niri's
+    // reported window title and `app_id`, however, are the composer's
+    // authoritative identity for the focused window and reliably name
+    // the game even when /proc-based PID matching is blind to it.
+    //
+    // We match case-insensitively against the configured game's title
+    // ("Shattered Empire" / "SEBNS" for SEBNS) and any obvious substring
+    // of the active game's name. The `niri msg` subprocess is throttled
+    // to ~500ms inside `niri_foreground_identity_with_throttle` so a
+    // 150ms-poll detector loop doesn't fork 3x/sec.
+    if let Some(snap) = niri_foreground_identity_with_throttle() {
+        let title_lc = snap
+            .title
+            .as_deref()
+            .map(|t| t.to_ascii_lowercase())
+            .unwrap_or_default();
+        let app_id_lc = snap
+            .app_id
+            .as_deref()
+            .map(|a| a.to_ascii_lowercase())
+            .unwrap_or_default();
+        let want_lc = want.to_ascii_lowercase();
+        // The configured game's basename (e.g. "client.exe") won't
+        // appear in the title; we test substrings that uniquely
+        // identify SEBNS first, then fall back to the active game's
+        // raw name as a generic title-substring match.
+        let active_lc = active.to_ascii_lowercase();
+        let title_hit = title_lc.contains("shattered")
+            || title_lc.contains("sebns")
+            || (!active_lc.is_empty() && title_lc.contains(&active_lc));
+        let app_id_hit = app_id_lc.contains("sebns")
+            || app_id_lc.contains("shattered")
+            || app_id_lc.contains(&want_lc);
+        let hit = title_hit || app_id_hit;
+        eprintln!(
+            "[DEBUG-DIAG.focused] niri msg title={:?} app_id={:?} -> {}",
+            snap.title.as_deref().unwrap_or(""),
+            snap.app_id.as_deref().unwrap_or(""),
+            hit
+        );
+        if hit {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Recursively walk descendants of `root_pid` up to `max_depth` levels,
+/// invoking `exe_basename_matches` on each visited pid and logging the
+/// result. Returns `true` on the first matching descendant.
+///
+/// We track visited pids to defend against PID-reparent cycles (a child
+/// that gets reparented back to an already-visited ancestor would
+/// otherwise loop until the depth cap ran out). Pids that are 0, our
+/// own pid, or zombies are skipped — `exe_basename_matches` also
+/// enforces these guards, but skipping here avoids the work of
+/// re-stat'ing them.
+fn walk_descendants_for_match(root_pid: u32, want: &str, max_depth: u32) -> bool {
+    let own = current_process_id();
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    visited.insert(root_pid);
+    let mut frontier: Vec<(u32, u32)> = vec![(root_pid, 0)];
+    while let Some((parent, depth)) = frontier.pop() {
+        if depth >= max_depth {
+            continue;
+        }
+        for child in read_child_pids(parent) {
+            if child == 0 || child == own || child == root_pid {
+                continue;
+            }
+            if is_zombie(child) {
+                continue;
+            }
+            if !visited.insert(child) {
+                continue;
+            }
+            let cm = exe_basename_matches(child, want);
+            eprintln!(
+                "[DEBUG-DIAG.focused] child[depth={}] exe_basename_matches(pid={}, want={}) -> {}",
+                depth + 1,
+                child,
+                want,
+                cm
+            );
+            if cm {
+                return true;
+            }
+            frontier.push((child, depth + 1));
+        }
+    }
+    false
 }
 
 /// Update the cached focused PID from the Niri event-stream JSON payload.
