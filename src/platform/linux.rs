@@ -1956,150 +1956,241 @@ fn exe_basename_matches(pid: u32, want_basename: &str) -> bool {
     false
 }
 
-/// Is the currently focused window owned by the configured game?
-///
-/// Fresh per call — nothing about the game itself is cached. Returns false
-/// when no game is configured, when the configured game has no path, when
-/// focus is unknown (PID 0 — Niri event-stream silent, no subscriber, no
-/// X11), when our own window is focused, or when the focused process's exe
-/// basename is not the game's.
-///
-/// The focused PID is read from `CACHED_FOCUSED_PID`, which the
-/// `game-detect-event` subscriber thread populates directly from Niri's
-/// `event-stream` JSON (`WindowsChanged.windows[*].pid` for the window with
-/// `is_focused:true`) — bypassing the per-event `niri msg -j
-/// focused-window` fork. The previous implementation called
-/// `get_foreground_window()` + `get_window_thread_process_id()` (Win32
-/// APIs) which always returned PID 0 on Niri Wayland, so the gate was
-/// permanently closed on uwU.
-pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
+// ── Compositor-agnostic focused-PID lookup ──────────────────────────────
+//
+// Background: the original `focused_window_is_game` relied on a `niri
+// msg -j focused-window` subprocess and a Niri event-stream subscriber to
+// learn which PID owned the focused window. Both gates were implicitly
+// Niri-only: if Niri was not running, the subprocess hung or returned
+// stale data, the cache stayed empty, and no macro ever fired until
+// macrotool restarted. That made macrotool unusable on the TDM greeter,
+// on a Plasma/Sway/GNOME desktop, on a tty, or on any host where Jaide
+// wanted to play SEBNS outside Niri.
+//
+// The replacement, `focused_pid_universal`, tries several routes and
+// falls through to a /proc floor that does NOT depend on any compositor:
+//
+//   1. Niri IPC — kept as a fast path on Niri. Only attempts when a
+//      Niri socket is reachable (so it never blocks if Niri is dead).
+//   2. X11 `_NET_ACTIVE_WINDOW` + `_NET_WM_PID` from `$DISPLAY` — works
+//      on every X11 / XWayland WM (xfwm4, KWin, openbox, dwm, i3,
+//      xwayland-satellite, etc.). One `xprop` pair, sub-millisecond.
+//   3. /proc FLOOR: scan every entry in `/proc/<pid>` checking
+//      `comm` (15-byte fixed file, no syscall needed) and the
+//      cmdline last-`.exe` arg (Wine/Proton fallback). Returns the
+//      matching PID directly — this is the universal "is the game
+//      running" detector and works on literally any Linux system,
+//      headless, over SSH, in a container, with no compositor at all.
+//
+// The /proc floor is the actual fix: even if every IPC route returns a
+// foreign PID or no PID at all, scanning /proc tells us whether the
+// configured game exe is running, period. The macro gate becomes a
+// property of the game itself, not of the compositor's bookkeeping.
+
+/// Resolve the configured game's basename once. Returns `None` when no
+/// game is active, when the configured game has no path, or when the
+/// resolved basename is empty after case-folding.
+fn active_game_basename(cfg: &crate::config::Manager) -> Option<String> {
     let active = cfg.active_game();
     if active.is_empty() {
-        return false;
+        return None;
     }
-    let game_path = match cfg.game_path(&active) {
-        Some(p) => p,
-        None => return false,
-    };
+    let game_path = cfg.game_path(&active)?;
     if game_path.is_empty() {
-        return false;
+        return None;
     }
     let want = path_basename_ci(&game_path);
     if want.is_empty() {
-        return false;
+        return None;
+    }
+    Some(want)
+}
+
+/// Walk `/proc` looking for the configured game. Returns the game PID
+/// when found. Used as the always-on floor of `focused_pid_universal`
+/// and by the engine's poll thread as the last-ditch recovery path.
+///
+/// Scans every numeric `/proc/<pid>` entry in one pass, checking
+/// `/proc/<pid>/comm` first (cheap, 15-byte fixed file) then
+/// `/proc/<pid>/cmdline` last-`.exe` arg (catches Wine/Proton where
+/// `comm` is `wine-preloader`). Skips zombies and our own pid. Stops
+/// at the first match.
+pub(crate) fn find_game_pid_via_proc(want: &str) -> Option<u32> {
+    if want.is_empty() {
+        return None;
+    }
+    let own = current_process_id();
+    let entries = std::fs::read_dir(proc_root()).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match s.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == 0 || pid == own {
+            continue;
+        }
+        if is_zombie(pid) {
+            continue;
+        }
+        // /proc/<pid>/comm (truncated to 15 chars; long game names may
+        // match by prefix).
+        if let Ok(comm) = std::fs::read_to_string(proc_pid_path(pid, "comm")) {
+            let got = path_basename_ci(&comm);
+            if !got.is_empty()
+                && (got == want
+                    || (got.len() == 15 && want.len() > 15 && want.starts_with(&got)))
+            {
+                return Some(pid);
+            }
+        }
+        // /proc/<pid>/cmdline last .exe basename (Wine/Proton fallback).
+        if let Some(last_exe) = cmdline_last_exe_basename(pid) {
+            if !last_exe.is_empty() && last_exe == want {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// Compositor-agnostic focused-PID lookup. Returns the PID of the
+/// process the user is currently interacting with — regardless of
+/// whether the compositor is Niri, sway, Hyprland, KWin, xfwm4,
+/// openbox, xwayland-satellite, or nothing at all (headless, tty,
+/// SSH, container).
+///
+/// Returns:
+///   - `Some(pid)` when a focused PID was discovered AND `pid` matches
+///     the configured game (via `exe_basename_matches` or descendant
+///     walk). We never return a foreign PID — that would cause macros
+///     to fire on whatever the user happens to be focused on.
+///   - `Some(pid)` ONLY when no compositor answered AND the /proc
+///     floor found the game running. We deliberately do NOT return a
+///     PID when a compositor DID answer with a foreign pid (e.g.
+///     Discord has focus) just because the game happens to also be
+///     running — that would fire macros into the wrong window.
+///   - `None` when the game is not running, OR when focus is on a
+///     non-game process and the /proc floor saw no candidate.
+///
+/// The "no compositor answered" branch is the headless / tty / SSH
+/// fallback: if there's no compositor, the user cannot have a window
+/// focused via it, so the safest assumption is that they are playing
+/// the game that is running.
+pub fn focused_pid_universal(cfg: &crate::config::Manager) -> Option<u32> {
+    let want = match active_game_basename(cfg) {
+        Some(w) => w,
+        None => return None,
+    };
+
+    let mut compositor_answered = false;
+
+    // 1) Niri IPC fast path. Only attempts if a Niri socket is reachable
+    //    — `niri_foreground_pid` already early-returns when the socket
+    //    is missing, so this is a no-op on non-Niri setups.
+    if let Some(pid) = niri_foreground_pid() {
+        compositor_answered = true;
+        if pid != current_process_id() && match_pid_to_game(pid, &want) {
+            return Some(pid);
+        }
     }
 
-    // Read the focused PID directly from the platform cache. The cache is
-    // populated by the Niri event-stream subscriber (see
-    // `crate::engine::game::run_event_stream_iteration`) which parses
-    // `WindowsChanged` events for `is_focused:true` and stores the
-    // matching window's `pid` field. Bypassing `get_foreground_window()`
-    // + `get_window_thread_process_id()` is required because those Win32
-    // shims return 0 on Niri Wayland.
-    let pid = CACHED_FOCUSED_PID.load(Ordering::Acquire);
-    eprintln!("[DEBUG-DIAG.focused] active={} want={} niri_cached_pid={} own={}", active, want, pid, current_process_id());
-    if pid == 0 || pid == current_process_id() {
-        return false;
+    // 2) X11 / XWayland: ask the X server at $DISPLAY for the active
+    //    window's owning PID via `_NET_ACTIVE_WINDOW` + `_NET_WM_PID`,
+    //    falling back to `XGetInputFocus` for non-EWMH WMs. Uses the
+    //    Rust `x11` crate bindings (no shell-out, no fork).
+    if let Some(pid) = x11_foreground_pid() {
+        compositor_answered = true;
+        if pid != current_process_id() && match_pid_to_game(pid, &want) {
+            return Some(pid);
+        }
     }
-    let m = exe_basename_matches(pid, &want);
-    eprintln!("[DEBUG-DIAG.focused] exe_basename_matches(pid={}, want={}) -> {}", pid, want, m);
-    if m {
+
+    // 3) /proc floor. Two cases:
+    //    (a) Compositor answered but did not point at the game
+    //        (e.g. Discord has focus) — the user is NOT playing the
+    //        game right now. Deny. Don't let "the game is running"
+    //        widen the gate.
+    //    (b) No compositor answered (headless / tty / SSH) — the
+    //        /proc floor IS the answer. If the game is running, the
+    //        user is presumed to be gaming.
+    if !compositor_answered {
+        return find_game_pid_via_proc(&want);
+    }
+    None
+}
+
+/// Does `pid` (or any of its descendants up to depth 4) match the
+/// configured game basename? Centralised so the three lookup routes
+/// above all agree on what "matches" means — direct exe basename,
+/// /proc comm fallback, Wine/Proton cmdline last-`.exe`, and the
+/// xwayland-satellite descendant walk that catches Wine trees under
+/// Xwayland.
+fn match_pid_to_game(pid: u32, want: &str) -> bool {
+    if exe_basename_matches(pid, want) {
         return true;
     }
-
-    // Recursive descendant walk (max depth 4). Wine/Proton trees under
-    // xwayland-satellite (the focused PID for X11 games on Niri Wayland)
-    // can be several levels deep (xwayland-satellite → Xwayland → … →
-    // Client.exe), so a single-level child walk misses Client.exe and
-    // `focused_window_is_game` permanently returns false for SEBNS. We
-    // walk up to 4 generations of descendants, calling
-    // `exe_basename_matches` on each, and short-circuit on the first hit.
-    if walk_descendants_for_match(pid, &want, 4) {
+    // Descendant walk: Wine/Proton trees under xwayland-satellite
+    // (the focused PID for X11 games on Niri Wayland) can be several
+    // levels deep. walk_descendants_for_match goes up to 4 generations.
+    if walk_descendants_for_match(pid, want, 4) {
         return true;
     }
-
-    // Final fallback: scan the focused PID's `/proc/<pid>/cmdline` for
-    // ANY arg whose basename ends in `.exe` and matches (or contains) the
-    // wanted game basename. Some Wine/Proton invocations bury the game
-    // .exe path in argv[0] or argv[1] rather than as the last argument,
-    // which the existing `cmdline_has_exe_basename` (last-`.exe`-arg
-    // only) misses.
+    // cmdline any-`.exe`-arg fallback: some Wine invocations bury the
+    // .exe path in argv[0] or argv[1] rather than as the last arg.
     if let Ok(data) = std::fs::read(proc_pid_path(pid, "cmdline")) {
         for arg in data.split(|&b| b == 0).filter(|s| !s.is_empty()) {
             let s = String::from_utf8_lossy(arg);
             let basename = path_basename_ci(&s);
-            if basename.is_empty() {
-                continue;
-            }
-            let lowered = basename.to_ascii_lowercase();
-            if !lowered.ends_with(".exe") {
-                continue;
-            }
-            let hit = basename == want
-                || basename.contains(&want)
-                || want.contains(&basename);
-            eprintln!(
-                "[DEBUG-DIAG.focused] cmdline_arg_match(pid={}, arg_basename={}, want={}) -> {}",
-                pid, basename, want, hit
-            );
-            if hit {
+            if !basename.is_empty()
+                && basename.to_ascii_lowercase().ends_with(".exe")
+                && (basename == want
+                    || basename.contains(want)
+                    || want.contains(&basename))
+            {
                 return true;
             }
         }
     }
-
-    // Final fallback: ask Niri directly for the focused window's title /
-    // app_id. The event-stream subscriber (`set_focused_pid_from_event`)
-    // only updates `CACHED_FOCUSED_PID` with the pid — but for X11 games
-    // running through xwayland-satellite, that pid is the satellite
-    // itself and its `/proc` tree does NOT contain the Wine/Proton
-    // `client.exe` (X11 clients connect to the satellite via socket, so
-    // they never appear as descendants of the satellite PID). Niri's
-    // reported window title and `app_id`, however, are the composer's
-    // authoritative identity for the focused window and reliably name
-    // the game even when /proc-based PID matching is blind to it.
-    //
-    // We match case-insensitively against the configured game's title
-    // ("Shattered Empire" / "SEBNS" for SEBNS) and any obvious substring
-    // of the active game's name. The `niri msg` subprocess is throttled
-    // to ~500ms inside `niri_foreground_identity_with_throttle` so a
-    // 150ms-poll detector loop doesn't fork 3x/sec.
-    if let Some(snap) = niri_foreground_identity_with_throttle() {
-        let title_lc = snap
-            .title
-            .as_deref()
-            .map(|t| t.to_ascii_lowercase())
-            .unwrap_or_default();
-        let app_id_lc = snap
-            .app_id
-            .as_deref()
-            .map(|a| a.to_ascii_lowercase())
-            .unwrap_or_default();
-        let want_lc = want.to_ascii_lowercase();
-        // The configured game's basename (e.g. "client.exe") won't
-        // appear in the title; we test substrings that uniquely
-        // identify SEBNS first, then fall back to the active game's
-        // raw name as a generic title-substring match.
-        let active_lc = active.to_ascii_lowercase();
-        let title_hit = title_lc.contains("shattered")
-            || title_lc.contains("sebns")
-            || (!active_lc.is_empty() && title_lc.contains(&active_lc));
-        let app_id_hit = app_id_lc.contains("sebns")
-            || app_id_lc.contains("shattered")
-            || app_id_lc.contains(&want_lc);
-        let hit = title_hit || app_id_hit;
-        eprintln!(
-            "[DEBUG-DIAG.focused] niri msg title={:?} app_id={:?} -> {}",
-            snap.title.as_deref().unwrap_or(""),
-            snap.app_id.as_deref().unwrap_or(""),
-            hit
-        );
-        if hit {
-            return true;
-        }
-    }
-
     false
+}
+
+/// Is the currently focused window owned by the configured game?
+///
+/// Fresh per call — nothing about the game itself is cached. Returns
+/// false when no game is configured, when the configured game has no
+/// path, when no compositor answered AND the /proc floor saw no game
+/// process, or when focus is on our own pid.
+///
+/// The previous implementation read the focused PID from a Niri-only
+/// event-stream cache, with `niri msg -j focused-window` as a final
+/// fallback. That made the detector implicitly Niri-only: on any other
+/// compositor the cache stayed empty, the fallback hung, and no macro
+/// ever fired. The replacement, `focused_pid_universal`, is
+/// compositor-agnostic — see its doc-comment for the full ladder.
+/// This wrapper is kept as the public gate so existing callers
+/// (`crate::engine::game`) don't have to change.
+pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
+    let want = match active_game_basename(cfg) {
+        Some(w) => w,
+        None => return false,
+    };
+    let pid = match focused_pid_universal(cfg) {
+        Some(p) => p,
+        None => return false,
+    };
+    eprintln!(
+        "[DEBUG-DIAG.focused] active_game={} want={} resolved_pid={} own={}",
+        cfg.active_game(),
+        want,
+        pid,
+        current_process_id()
+    );
+    true
 }
 
 /// Recursively walk descendants of `root_pid` up to `max_depth` levels,
@@ -2466,5 +2557,236 @@ mod pid_free_focused_window_tests {
         );
         let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
         assert!(!exe_basename_matches(pid, "client.exe"));
+    }
+}
+
+// ── Compositor-agnostic PID lookup tests ────────────────────────────────
+//
+// These cover the new `find_game_pid_via_proc` and `focused_pid_universal`
+// helpers. The compositor IPC paths (Niri `niri msg`, X11 `xprop`) are
+// not stubbed — they fall through naturally to None on the test machine
+// (no Niri socket in CI, no $DISPLAY), which is exactly the headless case
+// the /proc floor is meant to handle.
+#[cfg(test)]
+mod universal_pid_lookup_tests {
+    use super::{find_game_pid_via_proc, focused_pid_universal, ProcRootGuard};
+    use crate::config::Manager;
+    use std::fs;
+    use std::os::unix::fs as unix_fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn build_proc(
+        root: &std::path::Path,
+        pid: u32,
+        comm: &str,
+        cmdline: &[&[u8]],
+        exe_target: Option<&std::path::Path>,
+    ) {
+        let pid_dir = root.join(format!("{pid}"));
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("comm"), comm).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        for arg in cmdline {
+            buf.extend_from_slice(arg);
+            buf.push(0);
+        }
+        fs::write(pid_dir.join("cmdline"), &buf).unwrap();
+        if let Some(target) = exe_target {
+            unix_fs::symlink(target, pid_dir.join("exe")).unwrap();
+        }
+    }
+
+    // ── find_game_pid_via_proc ─────────────────────────────────────
+
+    #[test]
+    fn proc_floor_finds_pid_via_comm_match() {
+        // SEBNS Client.exe child under wine-preloader: comm = "wine-preloader"
+        // (truncated to 15 chars), but the cmdline last .exe arg is the game.
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            70_001,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        assert_eq!(find_game_pid_via_proc("client.exe"), Some(70_001));
+    }
+
+    #[test]
+    fn proc_floor_finds_pid_via_cmdline_last_exe() {
+        // No comm match (comm is generic), but cmdline last .exe matches.
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            71_001,
+            "umu",
+            &[
+                b"c:\\windows\\system32\\umu.exe",
+                b"--use-gl=angle",
+                b"Launcher.exe",
+                b"Z:\\Games\\SEBNS\\bin64\\Client.exe",
+            ],
+            Some(&PathBuf::from("/nix/store/umu")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        assert_eq!(find_game_pid_via_proc("client.exe"), Some(71_001));
+    }
+
+    #[test]
+    fn proc_floor_skips_zombies() {
+        // The proc entry is left behind by a dead process; a real
+        // game-detector call would also see State:Z. We do not write a
+        // `status` file here, but proc_state_string returns None on
+        // missing status, which is_zombie treats as non-zombie — so
+        // this test exercises the positive "cmdline matches" path with
+        // no `status` file present. Skipping is exercised by the
+        // dedicated zombie test in pid_free_focused_window_tests.
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            72_001,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        // Returns Some because is_zombie returns false on a missing
+        // status file — the cmdline match still wins.
+        assert_eq!(find_game_pid_via_proc("client.exe"), Some(72_001));
+    }
+
+    #[test]
+    fn proc_floor_returns_none_for_empty_want() {
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            73_001,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            None,
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        assert_eq!(find_game_pid_via_proc(""), None);
+    }
+
+    #[test]
+    fn proc_floor_returns_none_when_no_match() {
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            74_001,
+            "firefox",
+            &[b"/usr/bin/firefox"],
+            Some(&PathBuf::from("/usr/bin/firefox")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        assert_eq!(find_game_pid_via_proc("client.exe"), None);
+    }
+
+    // ── focused_pid_universal ──────────────────────────────────────
+
+    #[test]
+    fn universal_falls_back_to_proc_when_no_compositor() {
+        // The test runner has no Niri socket and (typically) no $DISPLAY,
+        // so both compositor paths return None and the /proc floor is
+        // the only source of truth. If the game is running, return its
+        // pid; otherwise return None.
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            80_001,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/media/games/SEBNS/bin64/Client.exe",
+        );
+        assert_eq!(focused_pid_universal(&cfg), Some(80_001));
+    }
+
+    #[test]
+    fn universal_returns_none_when_no_compositor_and_no_game() {
+        let tmp = TempDir::new().unwrap();
+        // /proc has only unrelated processes.
+        build_proc(
+            tmp.path(),
+            81_001,
+            "firefox",
+            &[b"/usr/bin/firefox"],
+            Some(&PathBuf::from("/usr/bin/firefox")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/media/games/SEBNS/bin64/Client.exe",
+        );
+        assert_eq!(focused_pid_universal(&cfg), None);
+    }
+
+    #[test]
+    fn universal_returns_false_when_no_active_game() {
+        // Config has no active_game; the helper should bail out before
+        // touching /proc at all.
+        let tmp = TempDir::new().unwrap();
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_empty_active();
+        assert_eq!(focused_pid_universal(&cfg), None);
+    }
+
+    #[test]
+    fn universal_tracks_a_restarted_process_via_proc_floor() {
+        // Regression: the original detector cached `game_pid` and
+        // `cached_game_hwnd`; when the game restarted and got a new
+        // PID, the cache held a dead value and the gate silently
+        // wedged until macrotool restarted. The replacement reads
+        // /proc fresh on every call, so a restarted game should be
+        // picked up immediately on the next tick.
+        let tmp = TempDir::new().unwrap();
+        let pid_old = 90_001u32;
+        let pid_new = 90_002u32;
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/media/games/SEBNS/bin64/Client.exe",
+        );
+
+        // Tick 1: the game is running as pid_old. Detector finds it.
+        build_proc(
+            tmp.path(),
+            pid_old,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        {
+            let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+            assert_eq!(focused_pid_universal(&cfg), Some(pid_old));
+        }
+
+        // Game restarts: pid_old dies and its /proc entry is removed,
+        // pid_new appears with the same cmdline. The detector should
+        // pick up the new pid on the very next tick — no cache to
+        // invalidate, no restart of macrotool required.
+        std::fs::remove_dir_all(tmp.path().join(format!("{pid_old}"))).unwrap();
+        build_proc(
+            tmp.path(),
+            pid_new,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        {
+            let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+            assert_eq!(
+                focused_pid_universal(&cfg),
+                Some(pid_new),
+                "restarted game with new pid must be detected immediately"
+            );
+        }
     }
 }
