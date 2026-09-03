@@ -70,43 +70,61 @@ impl GameDetector {
         self.game_present.load(Ordering::Acquire)
     }
 
-    /// Start the detection loop. Spawns two threads:
-    /// 1. **Event thread** — subscribes to `niri msg --json event-stream`
-    ///    and reacts to focus/window changes the instant Niri publishes
-    ///    them. No polling latency.
+    /// Start the detection loop. Spawns up to two threads:
+    /// 1. **Event thread** *(Niri only)* — subscribes to
+    ///    `niri msg --json event-stream` and reacts to focus/window
+    ///    changes the instant Niri publishes them. Only spawned when a
+    ///    Niri socket is reachable at startup; on every other compositor
+    ///    this thread is skipped and detection falls back to (2). That
+    ///    way macrotool keeps working on Sway, Hyprland, KWin, GNOME,
+    ///    the TDM greeter, tty, and SSH sessions.
     /// 2. **Poll thread** — once-a-second fallback that re-runs the full
-    ///    detector (which includes the Wine-cmdline scan) to recover
-    ///    from any events the event-stream missed (Niri hiccup, restart,
-    ///    race at startup).
+    ///    detector (which includes the /proc comm+cmdline floor and the
+    ///    compositor-agnostic `focused_pid_universal` lookup) to
+    ///    recover from any events the event-stream missed (Niri hiccup,
+    ///    restart, race at startup).
     pub fn start(self: &Arc<Self>, cfg: Arc<config::Manager>) {
         let detector1 = self.clone();
         let detector2 = self.clone();
         let cfg_for_poll = cfg.clone();
         let cfg_for_event = cfg.clone();
 
-        // Event-stream thread: instant focus tracking. Every time Niri
-        // emits a focus/window/workspace event we refresh the foreground
-        // cache, and (because the event carries the new pid directly) we
-        // also run the matching check_window path inline so the focus
-        // booleans are updated on the same instant the user clicked.
-        thread::Builder::new()
-            .name("game-detect-event".into())
-            .spawn(move || {
-                let socket_env = std::env::var("NIRI_SOCKET").ok();
-                let cfg = cfg_for_event;
-                loop {
-                    if detector1.run_event_stream_iteration(socket_env.as_deref(), cfg.clone()) {
-                        std::thread::sleep(Duration::from_millis(50));
-                    } else {
-                        std::thread::sleep(Duration::from_secs(2));
+        // Niri event-stream thread: only when a Niri socket is actually
+        // reachable. The previous implementation spawned this thread
+        // unconditionally and ran it in a tight reconnect loop on
+        // non-Niri compositors, which worked but was pure noise (and
+        // forked `niri msg` 6x/minute in a busy-loop forever on every
+        // host that did not happen to be running Niri).
+        if Self::niri_socket_available() {
+            thread::Builder::new()
+                .name("game-detect-event".into())
+                .spawn(move || {
+                    let socket_env = std::env::var("NIRI_SOCKET").ok();
+                    let cfg = cfg_for_event;
+                    loop {
+                        if detector1.run_event_stream_iteration(
+                            socket_env.as_deref(),
+                            cfg.clone(),
+                        ) {
+                            std::thread::sleep(Duration::from_millis(50));
+                        } else {
+                            std::thread::sleep(Duration::from_secs(2));
+                        }
                     }
-                }
-            })
-            .expect("spawn game-detect-event thread");
+                })
+                .expect("spawn game-detect-event thread");
+        } else {
+            log::info!(
+                "[detect] no Niri socket found at startup; relying on the \
+                 1Hz poll thread + /proc floor (compositor-agnostic path)."
+            );
+        }
 
         // Poll thread: once-a-second fallback. Runs the full detector
-        // (cfg + Wine-cmdline scan) so a missed event doesn't strand us
-        // in a stale state.
+        // (cfg + /proc floor + compositor-agnostic lookup) so a missed
+        // event doesn't strand us in a stale state. This thread is
+        // ALWAYS spawned — it is what makes macrotool work on every
+        // non-Niri compositor.
         thread::Builder::new()
             .name("game-detect-poll".into())
             .spawn(move || loop {
@@ -114,6 +132,26 @@ impl GameDetector {
                 std::thread::sleep(Duration::from_secs(1));
             })
             .expect("spawn game-detect-poll thread");
+    }
+
+    /// Cheap probe used by `start` to decide whether to spawn the Niri
+    /// event-stream subscriber thread. Returns true when `$NIRI_SOCKET`
+    /// is set and points at a live socket, OR when a
+    /// `niri.wayland-1.*.sock` file exists under `/run/user/<uid>/`.
+    fn niri_socket_available() -> bool {
+        if let Ok(p) = std::env::var("NIRI_SOCKET") {
+            if !p.is_empty() && std::path::Path::new(&p).exists() {
+                return true;
+            }
+        }
+        let uid = unsafe { libc::getuid() };
+        let dir = std::path::PathBuf::from(format!("/run/user/{}", uid));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("niri.wayland-1."))
     }
 
     /// Subscribe to `niri msg --json event-stream` and trigger an
