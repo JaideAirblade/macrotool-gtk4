@@ -113,10 +113,30 @@ impl GameDetector {
                     }
                 })
                 .expect("spawn game-detect-event thread");
+        } else if crate::platform::umbriel_socket_available() {
+            // Umbriel event-stream thread: same instant-tick job as the
+            // Niri one, for hosts on the Umbriel compositor. `umbriel
+            // subscribe windows` emits one JSON line per window-list
+            // change (focus, open, close, move); each line busts the
+            // Umbriel focus-throttle cache and drives a full detector
+            // tick so focus transitions land in ~ms instead of waiting
+            // for the 1Hz poll.
+            let detector_u = self.clone();
+            let cfg_for_umbriel = cfg.clone();
+            thread::Builder::new()
+                .name("game-detect-umbriel".into())
+                .spawn(move || loop {
+                    if detector_u.run_umbriel_event_iteration(cfg_for_umbriel.clone()) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    } else {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                })
+                .expect("spawn game-detect-umbriel thread");
         } else {
             log::info!(
-                "[detect] no Niri socket found at startup; relying on the \
-                 1Hz poll thread + /proc floor (compositor-agnostic path)."
+                "[detect] no Niri or Umbriel socket found at startup; relying on the \
+                 1Hz poll thread + X11 route (compositor-agnostic path)."
             );
         }
 
@@ -257,6 +277,74 @@ impl GameDetector {
                 // within a couple of ms.
                 self.check_window(&cfg);
             }
+        }
+    }
+
+    /// Subscribe to `umbriel subscribe windows` and drive an instant
+    /// detector tick on every window-list change (focus, open, close,
+    /// move). Returns true on a healthy iteration; false on fatal
+    /// error so the caller backs off and retries. Mirrors
+    /// `run_event_stream_iteration` (the Niri equivalent).
+    fn run_umbriel_event_iteration(&self, cfg: Arc<crate::config::Manager>) -> bool {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let socket = match crate::platform::umbriel_socket_path_string() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let mut child = match Command::new("umbriel")
+            .args(["subscribe", "windows"])
+            .env("UMBRIEL_SOCKET", &socket)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("[detect] umbriel subscribe spawn failed: {}", e);
+                return false;
+            }
+        };
+
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        };
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    log::warn!("[detect] umbriel event-stream EOF — reconnecting in 2s");
+                    let _ = child.wait();
+                    return false;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("[detect] umbriel event-stream read error: {}", e);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+            let t = line.trim();
+            if t.is_empty() || !t.contains("\"event\"") {
+                continue;
+            }
+            // Any windows-list change can move focus: bust the throttle
+            // cache so the next query re-runs `umbriel windows --json`
+            // immediately, then tick the full detector on the spot.
+            crate::platform::umbriel_invalidate_focus_cache();
+            self.check_window(&cfg);
         }
     }
 

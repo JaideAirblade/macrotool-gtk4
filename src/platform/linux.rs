@@ -2058,69 +2058,456 @@ pub(crate) fn find_game_pid_via_proc(want: &str) -> Option<u32> {
     None
 }
 
+// ── Umbriel IPC focus route ─────────────────────────────────────────────
+//
+// UwU moved from Niri to the Umbriel compositor (noctalia-dev). Umbriel
+// exposes `umbriel windows --json`: a JSON array of window objects with
+// an authoritative `"active": true` on exactly the window the user
+// interacts with (its `"focused"` field is per-workspace noise — several
+// windows can carry it — so only `active` is trustworthy) plus an
+// `"xwayland": bool` telling native Wayland windows apart from X11 ones
+// routed through xwayland-satellite.
+//
+// That second fact is what makes this route decisive for the focus gate:
+// the game is an Xwayland window, and the X11 satellite ONLY sees X11
+// windows. After the user focuses a native window (Discord, ghostty,
+// Firefox), the satellite still reports the game as the active X11
+// window — forever stale. Umbriel sees both worlds, so its answer wins
+// whenever it is reachable.
+
+/// The subset of an `umbriel windows --json` entry the gate cares about.
+#[derive(Clone, Debug)]
+struct UmbrielWindow {
+    #[allow(dead_code)]
+    app_id: String,
+    #[allow(dead_code)]
+    title: String,
+    xwayland: bool,
+}
+
+/// Result of one Umbriel focus snapshot.
+#[derive(Clone, Debug)]
+enum UmbrielFocus {
+    /// Umbriel answered; this window is the active one.
+    Active(UmbrielWindow),
+    /// Umbriel answered; no window is active (empty workspace).
+    NoActiveWindow,
+}
+
+/// Locate the Umbriel IPC socket. Honours `$UMBRIEL_SOCKET` first (set
+/// by the compositor session), then `$XDG_RUNTIME_DIR/umbriel-
+/// $WAYLAND_DISPLAY.sock`, then scans `/run/user/<uid>/` for any
+/// `umbriel-*.sock`. Returns `None` when Umbriel is not running — the
+/// caller then falls through to the next route in the ladder.
+fn umbriel_socket_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("UMBRIEL_SOCKET") {
+        if !p.is_empty() && Path::new(&p).exists() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("/run/user/{}", uid)));
+    if let Ok(display) = std::env::var("WAYLAND_DISPLAY") {
+        if !display.is_empty() {
+            let cand = runtime_dir.join(format!("umbriel-{}.sock", display));
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    // Scan: sessions may rename displays (wayland-0, wayland-1, ...).
+    let entries = std::fs::read_dir(&runtime_dir).ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("umbriel-") && n.ends_with(".sock")
+                })
+                .unwrap_or(false)
+        })
+        .filter(|p| p.exists())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// Parse `umbriel windows --json` output into an `UmbrielFocus`.
+/// Exactly one window carries `"active": true`; if none does, the
+/// compositor answered "nothing active" (deny, fail-closed).
+fn parse_umbriel_windows(stdout: &[u8]) -> Option<UmbrielFocus> {
+    let json = serde_json::from_slice::<serde_json::Value>(stdout).ok()?;
+    let arr = json.as_array()?;
+    for win in arr {
+        if win.get("active").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let app_id = win
+                .get("app_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let title = win
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let xwayland = win
+                .get("xwayland")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            return Some(UmbrielFocus::Active(UmbrielWindow {
+                app_id,
+                title,
+                xwayland,
+            }));
+        }
+    }
+    Some(UmbrielFocus::NoActiveWindow)
+}
+
+/// Throttled Umbriel focus snapshot (500ms TTL), same rationale as
+/// `niri_foreground_identity_with_throttle`: the detector polls ~1Hz and
+/// re-checks on every focus event; without a cache each tick would fork
+/// `umbriel windows --json`. On failure the previous snapshot's TTL is
+/// NOT extended, so a dead compositor quickly stops answering and the
+/// ladder falls through rather than acting on stale data.
+static UMBRIEL_FOCUS_CACHE: Lazy<Mutex<Option<(Instant, Option<UmbrielFocus>)>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// Bust the Umbriel focus-throttle cache. Called by the Umbriel event
+/// subscriber on every `windows` event so a focus change is re-queried
+/// immediately instead of up to 500ms later.
+pub fn umbriel_invalidate_focus_cache() {
+    *UMBRIEL_FOCUS_CACHE.lock() = None;
+}
+
+/// Is an Umbriel IPC socket reachable? Cheap probe used to decide
+/// whether to spawn the Umbriel event-subscriber thread.
+pub fn umbriel_socket_available() -> bool {
+    umbriel_socket_path().is_some()
+}
+
+/// String form of `umbriel_socket_path`, for subscribers that need to
+/// pass `$UMBRIEL_SOCKET` to a spawned `umbriel` process.
+pub fn umbriel_socket_path_string() -> Option<String> {
+    umbriel_socket_path().map(|p| p.to_string_lossy().into_owned())
+}
+
+fn umbriel_focus() -> Option<UmbrielFocus> {
+    const TTL: Duration = Duration::from_millis(500);
+
+    {
+        let guard = UMBRIEL_FOCUS_CACHE.lock();
+        if let Some((at, ref snap)) = *guard {
+            if at.elapsed() < TTL {
+                return snap.clone();
+            }
+        }
+    }
+
+    let fresh = umbriel_focus_inner();
+    if fresh.is_some() {
+        *UMBRIEL_FOCUS_CACHE.lock() = Some((Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+/// Run `umbriel windows --json` with a hard 100ms timeout (same guard
+/// as the Niri path: a wedged compositor must never stall the detector
+/// thread). Returns `None` when Umbriel isn't running / unreachable —
+/// the caller treats that as "route unavailable", not "no window".
+fn umbriel_focus_inner() -> Option<UmbrielFocus> {
+    let socket = umbriel_socket_path()?;
+    let mut child = Command::new("umbriel")
+        .args(["windows", "--json"])
+        .env("UMBRIEL_SOCKET", &socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_millis(100);
+
+    let mut stdout_handle = child.stdout.take();
+    let drain_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = Vec::new();
+        if let Some(mut s) = stdout_handle.take() {
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+        }
+        out
+    });
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout_bytes = drain_thread.join().unwrap_or_default();
+                let _ = child.wait();
+                if !status.success() {
+                    return None;
+                }
+                return parse_umbriel_windows(&stdout_bytes);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    log::warn!(
+                        "[linux] umbriel windows --json timed out after {:?} — killing subprocess",
+                        timeout
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = drain_thread.join();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = drain_thread.join();
+                return None;
+            }
+        }
+    }
+}
+
 /// Compositor-agnostic focused-PID lookup. Returns the PID of the
 /// process the user is currently interacting with — regardless of
-/// whether the compositor is Niri, sway, Hyprland, KWin, xfwm4,
-/// openbox, xwayland-satellite, or nothing at all (headless, tty,
-/// SSH, container).
+/// whether the compositor is Umbriel, Niri, sway, Hyprland, KWin,
+/// xfwm4, openbox, xwayland-satellite, or nothing at all (headless,
+/// tty, SSH, container).
 ///
-/// Returns:
-///   - `Some(pid)` when a focused PID was discovered AND `pid` matches
-///     the configured game (via `exe_basename_matches` or descendant
-///     walk). We never return a foreign PID — that would cause macros
-///     to fire on whatever the user happens to be focused on.
-///   - `Some(pid)` ONLY when no compositor answered AND the /proc
-///     floor found the game running. We deliberately do NOT return a
-///     PID when a compositor DID answer with a foreign pid (e.g.
-///     Discord has focus) just because the game happens to also be
-///     running — that would fire macros into the wrong window.
-///   - `None` when the game is not running, OR when focus is on a
-///     non-game process and the /proc floor saw no candidate.
+/// Route ladder (first route that ANSWERS wins; an answered route's
+/// verdict is final):
 ///
-/// The "no compositor answered" branch is the headless / tty / SSH
-/// fallback: if there's no compositor, the user cannot have a window
-/// focused via it, so the safest assumption is that they are playing
-/// the game that is running.
+///   1. Umbriel IPC (`umbriel windows --json`, the `"active": true`
+///      entry). Umbriel is the only authority that knows about BOTH
+///      native-Wayland and Xwayland windows. Native window active →
+///      the X11-only game cannot be focused → deny. Xwayland window
+///      active → identity confirmed via the X server before allowing.
+///   2. Niri IPC (`niri msg -j focused-window`) — kept for hosts still
+///      on Niri. Only attempts when a Niri socket is reachable.
+///   3. X11 `_NET_ACTIVE_WINDOW` + `_NET_WM_PID` from `$DISPLAY` —
+///      for plain X11 sessions with a real WM.
+///
+/// There is deliberately NO /proc floor any more. The old "no
+/// compositor answered → if the game is running, presume playing"
+/// fallback was the misfire: on a desktop whose compositor macrotool
+/// does not speak IPC with (UwU after the Niri → Umbriel switch), the
+/// ladder fell straight through to the floor and the gate opened
+/// whenever the game was merely RUNNING, focus be damned. The /proc
+/// scan stays available for PRESENCE detection (`is_present` /
+/// `find_live_game_exe`) — it just never authorises injection.
+///
+/// Fail-closed: unknown focus denies macros. A transient IPC hiccup
+/// costs at most one poll interval (1s) of silence, never a misfire.
 pub fn focused_pid_universal(cfg: &crate::config::Manager) -> Option<u32> {
     let want = match active_game_basename(cfg) {
         Some(w) => w,
         None => return None,
     };
 
-    let mut compositor_answered = false;
+    // 1) Umbriel IPC. When Umbriel answers, its verdict is FINAL —
+    //    this is what closes the stale-satellite hole: after focus
+    //    moves from the game to a native Wayland window (Discord,
+    //    ghostty), xwayland-satellite still reports the game as the
+    //    active X11 window because it never sees native windows at
+    //    all. Umbriel does, and says "not the game".
+    if let Some(focus) = umbriel_focus() {
+        return match focus {
+            UmbrielFocus::NoActiveWindow => None,
+            UmbrielFocus::Active(win) => {
+                if win.xwayland {
+                    // Xwayland window is active — resolve WHICH one via
+                    // the X server's own focus + _NET_WM_PID and match
+                    // it against the configured game before allowing.
+                    // (X11 exists in this session by definition: the
+                    // active window is an X11 window.)
+                    match x11_foreground_pid() {
+                        Some(pid)
+                            if pid != current_process_id()
+                                && match_pid_to_game(pid, &want) =>
+                        {
+                            Some(pid)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    // Native Wayland window is active — there is NO X11
+                    // in this decision path at all. Umbriel's window
+                    // list carries no PID, so identity is matched via
+                    // app_id/title against candidates derived from the
+                    // configured game (exe stem, path components, game
+                    // name), and only after the game process is
+                    // confirmed live via /proc. This is what makes the
+                    // gate work for native-Wayland games.
+                    native_wayland_focus_pid(cfg, &win, &want)
+                }
+            }
+        };
+    }
 
-    // 1) Niri IPC fast path. Only attempts if a Niri socket is reachable
-    //    — `niri_foreground_pid` already early-returns when the socket
-    //    is missing, so this is a no-op on non-Niri setups.
+    // 2) Niri IPC fast path. Only attempts if a Niri socket is reachable
+    //    (`niri_foreground_pid` early-returns when the socket is missing,
+    //    so this is a no-op on non-Niri setups). When Niri answers, its
+    //    verdict is final — same authority rule as the Umbriel route.
     if let Some(pid) = niri_foreground_pid() {
-        compositor_answered = true;
         if pid != current_process_id() && match_pid_to_game(pid, &want) {
             return Some(pid);
         }
+        return None;
     }
 
-    // 2) X11 / XWayland: ask the X server at $DISPLAY for the active
+    // 3) X11 / XWayland: ask the X server at $DISPLAY for the active
     //    window's owning PID via `_NET_ACTIVE_WINDOW` + `_NET_WM_PID`,
     //    falling back to `XGetInputFocus` for non-EWMH WMs. Uses the
-    //    Rust `x11` crate bindings (no shell-out, no fork).
+    //    Rust `x11` crate bindings (no shell-out, no fork). On a
+    //    Wayland compositor without an IPC route, this X11 answer can
+    //    be stale-satellite data (it only sees X11 windows) — but the
+    //    Umbriel and Niri routes above already handled that case, and
+    //    this branch only runs when neither compositor IPC answered.
     if let Some(pid) = x11_foreground_pid() {
-        compositor_answered = true;
         if pid != current_process_id() && match_pid_to_game(pid, &want) {
             return Some(pid);
         }
     }
 
-    // 3) /proc floor. Two cases:
-    //    (a) Compositor answered but did not point at the game
-    //        (e.g. Discord has focus) — the user is NOT playing the
-    //        game right now. Deny. Don't let "the game is running"
-    //        widen the gate.
-    //    (b) No compositor answered (headless / tty / SSH) — the
-    //        /proc floor IS the answer. If the game is running, the
-    //        user is presumed to be gaming.
-    if !compositor_answered {
-        return find_game_pid_via_proc(&want);
+    // No compositor answered → deny (fail-closed). See the doc comment:
+    // the old /proc floor here was the "fires into the wrong window"
+    // bug on any compositor macrotool has no IPC route for.
+    None
+}
+
+/// Identity match for a native-Wayland active window when no PID is
+/// available from the compositor. Derives candidate identity tokens
+/// from the configured game (exe stem, meaningful path components, the
+/// game's configured name), then checks the active window's `app_id`
+/// and `title` against them. The game process must ALSO be confirmed
+/// live via /proc first — presence is a precondition, not a grant.
+///
+/// Anti-false-positive guard: the tokens are short generic words
+/// ("client", "sebns", "shattered"), and chat apps love putting the
+/// game name in their title ("... | Shattered Empire - Discord").
+/// A title match alone is therefore NEVER enough; a title hit only
+/// counts when the app_id does not look like a chat/browser shell, and
+/// the exe-stem token only counts when the app_id equals it exactly
+/// (Steam-style app_ids like "steam_app_1234" never will).
+fn native_wayland_focus_pid(
+    cfg: &crate::config::Manager,
+    win: &UmbrielWindow,
+    want: &str,
+) -> Option<u32> {
+    // Precondition: the game is actually running. /proc presence is
+    // cheap and never authorises anything on its own — it just stops a
+    // stale title match from opening the gate for a dead game.
+    let game_pid = find_game_pid_via_proc(want)?;
+
+    // Identity tokens from the config.
+    let game_path = cfg.game_path(&cfg.active_game()).unwrap_or_default();
+    let exe_stem = path_basename_ci(want).trim_end_matches(".exe").to_string();
+    let mut tokens: Vec<String> = vec![exe_stem.clone(), want.to_string()];
+    // Path components of the game dir, skipping common noise
+    // ("games", "bin", "bin64", "drive_c", "prefixes", ...) plus
+    // LAUNCHER names and the username: the game living under
+    // ~/Games/Heroic/Prefixes/... must not make "heroic" a token —
+    // the Heroic launcher's app_id IS "heroic" and would match.
+    const NOISE: &[&str] = &[
+        "games", "bin", "bin32", "bin64", "drive_c", "prefixes", "programs",
+        "files", "steamapps", "common", "compatibilitytools.d", "windows",
+        "system32", "program files", "users", "home", "local", "share",
+        // launchers / tooling that appear inside game paths
+        "heroic", "steam", "umu", "bottles", "lutris", "legendary",
+        "proton", "wine", "gamescope", "umu-launcher", "flatpak",
+    ];
+    let noise_lc: Vec<String> = NOISE.iter().map(|s| s.to_string()).collect();
+    let user_name = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    for comp in game_path.split(['/', '\\']).filter(|c| !c.is_empty()) {
+        let lc = comp.to_ascii_lowercase();
+        if lc.len() < 4 || noise_lc.contains(&lc) {
+            continue;
+        }
+        if !user_name.is_empty() && lc == user_name {
+            continue;
+        }
+        tokens.push(lc);
     }
+    // The configured game NAME (e.g. "SEBNS") is the strongest human token.
+    let game_name = cfg.active_game().to_ascii_lowercase();
+    if !game_name.is_empty() {
+        tokens.push(game_name.clone());
+    }
+
+    let app_id = win.app_id.to_ascii_lowercase();
+    let title = win.title.to_ascii_lowercase();
+
+    // Never match macrotool's own window ("com.jaide.macrotool").
+    if app_id.contains("macrotool") {
+        return None;
+    }
+
+    // App-id match: strongest signal, no shell guard needed (a chat
+    // shell's app_id never carries the game's identity). Distinctive
+    // tokens (≥7 chars) may match by containment
+    // ("shatteredempire" in "com.shatteredempire.client"); short
+    // tokens like "client" only count on EXACT app_id equality.
+    for t in &tokens {
+        if t.is_empty() {
+            continue;
+        }
+        if t.chars().count() >= 7 && app_id.contains(t.as_str()) {
+            return Some(game_pid);
+        }
+        if t.chars().count() >= 4 && app_id == *t {
+            return Some(game_pid);
+        }
+    }
+
+    // Title match: weaker, so doubly guarded. Only when the app_id is
+    // NOT a known chat/browser/terminal shell (those legitimately put
+    // the game's name in their title: "#general | Shattered Empire -
+    // Discord"), and only for distinctive tokens: the configured game
+    // NAME (human-chosen, e.g. "sebns" — chat titles spell the game
+    // out, not the acronym) or a path token ≥7 chars that is not a
+    // generic word ("client", "launcher", ...).
+    const CHAT_SHELL_IDS: &[&str] = &[
+        "discord", "vesktop", "webcord", "telegram", "firefox", "librewolf",
+        "chromium", "chrome", "brave", "helium", "foot", "kitty", "alacritty",
+        "ghostty", "wezterm", "element", "signal", "whatsapp", "slack",
+        "teams", "thunderbird", "obs", "spotify",
+    ];
+    if CHAT_SHELL_IDS.iter().any(|s| app_id.contains(s)) {
+        return None;
+    }
+    const GENERIC_WORDS: &[&str] = &[
+        "client", "launcher", "player", "editor", "server", "updater",
+        "crash", "report", "settings", "options",
+    ];
+    if game_name.chars().count() >= 3 && title.contains(&game_name) {
+        return Some(game_pid);
+    }
+    for t in &tokens {
+        if t.chars().count() >= 7
+            && !GENERIC_WORDS.contains(&t.as_str())
+            && title.contains(t.as_str())
+        {
+            return Some(game_pid);
+        }
+    }
+
     None
 }
 
@@ -2175,22 +2562,7 @@ fn match_pid_to_game(pid: u32, want: &str) -> bool {
 /// This wrapper is kept as the public gate so existing callers
 /// (`crate::engine::game`) don't have to change.
 pub fn focused_window_is_game(cfg: &crate::config::Manager) -> bool {
-    let want = match active_game_basename(cfg) {
-        Some(w) => w,
-        None => return false,
-    };
-    let pid = match focused_pid_universal(cfg) {
-        Some(p) => p,
-        None => return false,
-    };
-    eprintln!(
-        "[DEBUG-DIAG.focused] active_game={} want={} resolved_pid={} own={}",
-        cfg.active_game(),
-        want,
-        pid,
-        current_process_id()
-    );
-    true
+    focused_pid_universal(cfg).is_some()
 }
 
 /// Recursively walk descendants of `root_pid` up to `max_depth` levels,
@@ -2223,13 +2595,6 @@ fn walk_descendants_for_match(root_pid: u32, want: &str, max_depth: u32) -> bool
                 continue;
             }
             let cm = exe_basename_matches(child, want);
-            eprintln!(
-                "[DEBUG-DIAG.focused] child[depth={}] exe_basename_matches(pid={}, want={}) -> {}",
-                depth + 1,
-                child,
-                want,
-                cm
-            );
             if cm {
                 return true;
             }
@@ -2350,7 +2715,9 @@ fn read_cmdline_arg_for(pid: u32, want_basename: &str) -> Option<String> {
 #[cfg(test)]
 mod pid_free_focused_window_tests {
     use super::{
-        exe_basename_matches, find_live_game_exe, focused_window_is_game, path_basename_ci,
+        exe_basename_matches, find_game_pid_via_proc, find_live_game_exe,
+        focused_pid_universal, focused_window_is_game, native_wayland_focus_pid,
+        parse_umbriel_windows, path_basename_ci, UmbrielFocus, UmbrielWindow,
         ProcRootGuard,
     };
     use crate::config::Manager;
@@ -2569,7 +2936,10 @@ mod pid_free_focused_window_tests {
 // the /proc floor is meant to handle.
 #[cfg(test)]
 mod universal_pid_lookup_tests {
-    use super::{find_game_pid_via_proc, focused_pid_universal, ProcRootGuard};
+    use super::{
+        find_game_pid_via_proc, focused_pid_universal, native_wayland_focus_pid,
+        parse_umbriel_windows, UmbrielFocus, UmbrielWindow, ProcRootGuard,
+    };
     use crate::config::Manager;
     use std::fs;
     use std::os::unix::fs as unix_fs;
@@ -2690,10 +3060,12 @@ mod universal_pid_lookup_tests {
 
     #[test]
     fn universal_falls_back_to_proc_when_no_compositor() {
-        // The test runner has no Niri socket and (typically) no $DISPLAY,
-        // so both compositor paths return None and the /proc floor is
-        // the only source of truth. If the game is running, return its
-        // pid; otherwise return None.
+        // REMOVED CONTRACT: the /proc floor no longer authorises focus.
+        // With no compositor reachable (test env has no Niri/Umbriel
+        // socket), the gate must now DENY even when the game process
+        // is running — "game running" is not "game focused". This is
+        // the exact behaviour that fired macros into the wrong window
+        // on hosts whose compositor macrotool had no IPC route for.
         let tmp = TempDir::new().unwrap();
         build_proc(
             tmp.path(),
@@ -2707,7 +3079,11 @@ mod universal_pid_lookup_tests {
             "SEBNS",
             "/media/games/SEBNS/bin64/Client.exe",
         );
-        assert_eq!(focused_pid_universal(&cfg), Some(80_001));
+        assert_eq!(
+            focused_pid_universal(&cfg),
+            None,
+            "no compositor + game running must DENY (fail-closed), not presume playing"
+        );
     }
 
     #[test]
@@ -2741,21 +3117,14 @@ mod universal_pid_lookup_tests {
 
     #[test]
     fn universal_tracks_a_restarted_process_via_proc_floor() {
-        // Regression: the original detector cached `game_pid` and
-        // `cached_game_hwnd`; when the game restarted and got a new
-        // PID, the cache held a dead value and the gate silently
-        // wedged until macrotool restarted. The replacement reads
-        // /proc fresh on every call, so a restarted game should be
-        // picked up immediately on the next tick.
+        // Presence tracking (find_live_game_exe / find_game_pid_via_proc)
+        // still picks up a restarted game immediately — only the FOCUS
+        // gate stopped consulting /proc. Assert the presence path here.
         let tmp = TempDir::new().unwrap();
         let pid_old = 90_001u32;
         let pid_new = 90_002u32;
-        let cfg = Manager::default_for_tests_with_active_game(
-            "SEBNS",
-            "/media/games/SEBNS/bin64/Client.exe",
-        );
 
-        // Tick 1: the game is running as pid_old. Detector finds it.
+        // Tick 1: the game is running as pid_old. Presence finds it.
         build_proc(
             tmp.path(),
             pid_old,
@@ -2765,13 +3134,12 @@ mod universal_pid_lookup_tests {
         );
         {
             let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
-            assert_eq!(focused_pid_universal(&cfg), Some(pid_old));
+            assert!(find_game_pid_via_proc("client.exe").is_some());
         }
 
         // Game restarts: pid_old dies and its /proc entry is removed,
-        // pid_new appears with the same cmdline. The detector should
-        // pick up the new pid on the very next tick — no cache to
-        // invalidate, no restart of macrotool required.
+        // pid_new appears with the same cmdline. Presence must pick up
+        // the new pid on the very next tick.
         std::fs::remove_dir_all(tmp.path().join(format!("{pid_old}"))).unwrap();
         build_proc(
             tmp.path(),
@@ -2783,10 +3151,176 @@ mod universal_pid_lookup_tests {
         {
             let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
             assert_eq!(
-                focused_pid_universal(&cfg),
+                find_game_pid_via_proc("client.exe"),
                 Some(pid_new),
                 "restarted game with new pid must be detected immediately"
             );
         }
+    }
+
+    // ── Umbriel route ──────────────────────────────────────────────────
+
+    fn umbriel_win(app_id: &str, title: &str, xwayland: bool) -> UmbrielWindow {
+        UmbrielWindow {
+            app_id: app_id.to_string(),
+            title: title.to_string(),
+            xwayland,
+        }
+    }
+
+    #[test]
+    fn umbriel_parser_picks_the_active_window() {
+        let json = b"[
+            {\"active\":false,\"app_id\":\"discord\",\"title\":\"#general | Shattered Empire - Discord\",\"xwayland\":false},
+            {\"active\":true,\"app_id\":\"steam_app_default\",\"title\":\"Shattered Empire\",\"xwayland\":true},
+            {\"active\":false,\"app_id\":\"foot\",\"title\":\"term\",\"xwayland\":false}
+        ]";
+        match parse_umbriel_windows(json) {
+            Some(UmbrielFocus::Active(w)) => {
+                assert_eq!(w.app_id, "steam_app_default");
+                assert_eq!(w.title, "Shattered Empire");
+                assert!(w.xwayland);
+            }
+            other => panic!("expected Active, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn umbriel_parser_reports_no_active_window() {
+        let json = b"[
+            {\"active\":false,\"app_id\":\"discord\",\"title\":\"d\",\"xwayland\":false}
+        ]";
+        assert!(matches!(
+            parse_umbriel_windows(json),
+            Some(UmbrielFocus::NoActiveWindow)
+        ));
+    }
+
+    #[test]
+    fn umbriel_parser_rejects_garbage() {
+        assert!(parse_umbriel_windows(b"not json").is_none());
+        assert!(parse_umbriel_windows(b"{}").is_none()); // not an array
+        assert!(matches!(
+            parse_umbriel_windows(b"[]"),
+            Some(UmbrielFocus::NoActiveWindow)
+        )); // empty list = nothing active
+    }
+
+    #[test]
+    fn native_wayland_match_via_game_name_token() {
+        // A native-Wayland game whose window title carries the
+        // configured game name ("SEBNS"), app_id is anything.
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            70_001,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/media/games/SEBNS/bin64/Client.exe",
+        );
+        let win = umbriel_win("some-native-game", "SEBNS — in-game", false);
+        assert_eq!(
+            native_wayland_focus_pid(&cfg, &win, "client.exe"),
+            Some(70_001)
+        );
+    }
+
+    #[test]
+    fn native_wayland_denies_discord_mentioning_the_game() {
+        // Discord's title legitimately contains "Shattered Empire".
+        // The chat-shell guard must keep the gate closed.
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            70_002,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/home/jaide/Games/Heroic/Prefixes/Shattered Empire/drive_c/Games/SEBNS/bin64/Client.exe",
+        );
+        let win = umbriel_win(
+            "discord",
+            "#general | Shattered Empire - Discord",
+            false,
+        );
+        assert_eq!(
+            native_wayland_focus_pid(&cfg, &win, "client.exe"),
+            None,
+            "chat shell mentioning the game in its title must NOT open the gate"
+        );
+    }
+
+    #[test]
+    fn native_wayland_denies_heroic_launcher() {
+        // The game lives under ~/Games/Heroic/... — "heroic" must never
+        // become an identity token; the launcher's app_id is "heroic".
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            70_003,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/home/jaide/Games/Heroic/Prefixes/Shattered Empire/drive_c/Games/SEBNS/bin64/Client.exe",
+        );
+        let win = umbriel_win("heroic", "Heroic Games Launcher", false);
+        assert_eq!(
+            native_wayland_focus_pid(&cfg, &win, "client.exe"),
+            None,
+            "the launcher that owns the game's process tree must NOT open the gate"
+        );
+    }
+
+    #[test]
+    fn native_wayland_denies_when_game_not_running() {
+        // Title matches, but no game process exists → deny (presence
+        // is a precondition, not a grant).
+        let proc_root = TempDir::new().unwrap();
+        build_proc(
+            proc_root.path(),
+            70_004,
+            "firefox",
+            &[b"/usr/bin/firefox"],
+            Some(&PathBuf::from("/usr/bin/firefox")),
+        );
+        let _guard = ProcRootGuard::install(proc_root.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/media/games/SEBNS/bin64/Client.exe",
+        );
+        let win = umbriel_win("some-native-game", "SEBNS — in-game", false);
+        assert_eq!(native_wayland_focus_pid(&cfg, &win, "client.exe"), None);
+    }
+
+    #[test]
+    fn native_wayland_denies_macrotool_own_window() {
+        let tmp = TempDir::new().unwrap();
+        build_proc(
+            tmp.path(),
+            70_005,
+            "wine-preloader",
+            &[b"Z:\\Games\\SEBNS\\bin64\\Client.exe"],
+            Some(&PathBuf::from("/nix/store/wine-preloader")),
+        );
+        let _guard = ProcRootGuard::install(tmp.path().to_path_buf());
+        let cfg = Manager::default_for_tests_with_active_game(
+            "SEBNS",
+            "/media/games/SEBNS/bin64/Client.exe",
+        );
+        let win = umbriel_win("com.jaide.macrotool", "Macrotool", false);
+        assert_eq!(native_wayland_focus_pid(&cfg, &win, "client.exe"), None);
     }
 }
