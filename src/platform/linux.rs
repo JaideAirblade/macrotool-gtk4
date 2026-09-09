@@ -1138,23 +1138,24 @@ fn x11_foreground_pid() -> Option<u32> {
     use std::ffi::CString;
     use std::os::raw::{c_int, c_ulong, c_uchar};
 
+    // Use a cached display connection. Opening and closing a new X11
+    // connection on every call (~7x/sec) exhausts Xwayland resources and
+    // corrupts GDK's own display connection after ~1800 cycles, causing
+    // "Error reading events from display: Invalid argument".
+    let display = match x11_display() {
+        Some(d) => d,
+        None => {
+            log::debug!("[linux] XOpenDisplay failed — no X11");
+            return None;
+        }
+    };
+
     // Save GDK's error handler and install ours only for the duration of
-    // our X11 calls. XSetErrorHandler is process-global — permanently
-    // replacing GDK's handler causes GDK to silently swallow its own X11
-    // errors, corrupting its display connection over time until
-    // "Error reading events from display: Invalid argument" kills the
-    // whole process.
+    // our X11 calls. XSetErrorHandler is process-global.
     let old_handler = unsafe { xlib::XSetErrorHandler(Some(x11_silent_error_handler)) };
     let _restore = X11ErrorHandlerGuard(old_handler);
 
     unsafe {
-        let display = xlib::XOpenDisplay(std::ptr::null());
-        if display.is_null() {
-            log::debug!("[linux] XOpenDisplay failed — no X11");
-            return None;
-        }
-        let _guard = DisplayGuard(display);
-
         let root = xlib::XDefaultRootWindow(display);
         let atom_active = CString::new("_NET_ACTIVE_WINDOW").ok()?;
         let atom_active = xlib::XInternAtom(display, atom_active.as_ptr(), 0);
@@ -1237,12 +1238,26 @@ fn x11_foreground_pid() -> Option<u32> {
     }
 }
 
-/// RAII guard to ensure XCloseDisplay is called.
-struct DisplayGuard(*mut x11::xlib::Display);
-impl Drop for DisplayGuard {
-    fn drop(&mut self) {
-        unsafe { x11::xlib::XCloseDisplay(self.0); }
+/// Cached X11 display connection. Opened once on first use and reused
+/// for all subsequent x11_foreground_pid calls. Opening/closing a new
+/// connection ~7x/sec exhausts Xwayland and corrupts GDK's connection.
+struct SendDisplay(*mut x11::xlib::Display);
+unsafe impl Send for SendDisplay {}
+unsafe impl Sync for SendDisplay {}
+
+static X11_DISPLAY: Lazy<parking_lot::Mutex<Option<SendDisplay>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+
+fn x11_display() -> Option<*mut x11::xlib::Display> {
+    let mut guard = X11_DISPLAY.lock();
+    if let Some(SendDisplay(d)) = *guard {
+        return Some(d);
     }
+    let d = unsafe { x11::xlib::XOpenDisplay(std::ptr::null()) };
+    if !d.is_null() {
+        *guard = Some(SendDisplay(d));
+    }
+    Some(d).filter(|d| !d.is_null())
 }
 
 /// Custom X11 error handler that swallows errors instead of calling the
