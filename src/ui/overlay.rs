@@ -560,15 +560,44 @@ fn prepare_qml_overlay(qml_dir: &Path) -> Result<PathBuf, String> {
 fn spawn_qml_overlay(state_path: &Path, qml_path: &Path) -> Result<Child, String> {
     let qs = std::env::var_os("MACROTOOL_QS").unwrap_or_else(|| "qs".into());
 
-    Command::new(qs)
-        .arg("--path")
+    let mut cmd = Command::new(qs);
+    cmd.arg("--path")
         .arg(qml_path)
         .env("MACROTOOL_OVERLAY_STATE", state_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::inherit());
+
+    // The overlay's QML shells out to `mmsg get all-clients` to check
+    // whether the game is visible on the active tag. mmsg needs
+    // MANGO_INSTANCE_SIGNATURE pointing at mango's IPC socket. If the
+    // var is already set (inherited from the DMS session), pass it
+    // through. Otherwise auto-detect: scan /run/user/<uid>/ for
+    // mango-<pid>.sock.
+    if std::env::var_os("MANGO_INSTANCE_SIGNATURE").is_none() {
+        if let Some(socket) = detect_mango_socket() {
+            cmd.env("MANGO_INSTANCE_SIGNATURE", socket);
+        }
+    }
+
+    cmd.spawn()
         .map_err(|error| format!("could not start Quickshell: {error}"))
+}
+
+/// Find mango's IPC socket at /run/user/<uid>/mango-<pid>.sock.
+/// Returns the full path if found.
+fn detect_mango_socket() -> Option<String> {
+    let uid = unsafe { libc::getuid() };
+    let dir = std::path::PathBuf::from(format!("/run/user/{}", uid));
+    let entries = std::fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("mango-") && name.ends_with(".sock") {
+            return Some(entry.path().to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
