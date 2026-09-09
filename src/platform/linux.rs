@@ -1138,9 +1138,14 @@ fn x11_foreground_pid() -> Option<u32> {
     use std::ffi::CString;
     use std::os::raw::{c_int, c_ulong, c_uchar};
 
-    // Install our silent error handler so BadWindow errors from stale window
-    // IDs don't kill the process.
-    install_x11_error_handler();
+    // Save GDK's error handler and install ours only for the duration of
+    // our X11 calls. XSetErrorHandler is process-global — permanently
+    // replacing GDK's handler causes GDK to silently swallow its own X11
+    // errors, corrupting its display connection over time until
+    // "Error reading events from display: Invalid argument" kills the
+    // whole process.
+    let old_handler = unsafe { xlib::XSetErrorHandler(Some(x11_silent_error_handler)) };
+    let _restore = X11ErrorHandlerGuard(old_handler);
 
     unsafe {
         let display = xlib::XOpenDisplay(std::ptr::null());
@@ -1252,14 +1257,18 @@ extern "C" fn x11_silent_error_handler(
     0
 }
 
-/// Install the silent X11 error handler once. Must be called before any
-/// XGetWindowProperty / XQueryTree calls.
-static X11_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
-fn install_x11_error_handler() {
-    if !X11_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
-        unsafe {
-            x11::xlib::XSetErrorHandler(Some(x11_silent_error_handler));
-        }
+/// RAII guard that restores the previous X11 error handler on drop.
+/// XSetErrorHandler is process-global, so we must not permanently clobber
+/// GDK's handler — doing so causes GDK to silently swallow its own display
+/// errors, eventually crashing with "Error reading events from display:
+/// Invalid argument".
+struct X11ErrorHandlerGuard(Option<unsafe extern "C" fn(
+    *mut x11::xlib::Display,
+    *mut x11::xlib::XErrorEvent,
+) -> std::os::raw::c_int>);
+impl Drop for X11ErrorHandlerGuard {
+    fn drop(&mut self) {
+        unsafe { x11::xlib::XSetErrorHandler(self.0); }
     }
 }
 
