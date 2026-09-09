@@ -41,6 +41,21 @@ fn install_renderer_fallback() {
     if let Some(renderer) = renderer_fallback(std::env::var_os("GSK_RENDERER").as_deref()) {
         std::env::set_var("GSK_RENDERER", renderer);
     }
+    // Force the X11 GDK backend instead of Wayland. GTK4's Wayland backend
+    // leaks wlroots shm buffer file descriptors on every render cycle —
+    // hundreds of /dev/shm/wlroots-* (deleted) fds accumulate until the
+    // process hits EMFILE (Too many open files), at which point the overlay
+    // state writer fails and GDK's own display connection dies with
+    // "Error reading events from display: Invalid argument".
+    //
+    // The X11 backend (via Xwayland) does not have this leak. Macrotool's
+    // own X11 focus detection already uses Xwayland on :0, and the overlay
+    // spawns quickshell as a separate process (which uses Wayland directly
+    // for layer-shell), so forcing X11 here only affects macrotool's own
+    // GTK window, not the overlay.
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
 }
 
 /// Theme-aware UI styling. GTK4 app CSS cannot reference @theme_* variables
