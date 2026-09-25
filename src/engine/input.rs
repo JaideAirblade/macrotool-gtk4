@@ -437,7 +437,9 @@ fn hook_thread_fn(
 // `TEST_FOCUSED_PID` (non-zero) before calling `handle_hotkey_key`, and
 // zero it again afterwards.
 #[cfg(test)]
-static TEST_FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
+thread_local! {
+    static TEST_FOCUSED_PID: AtomicU32 = const { AtomicU32::new(0) };
+}
 
 /// One-shot warn so the emergency-stop explanation doesn't spam the log
 /// on every mouse press after Ctrl+Shift+Esc is hit by accident.
@@ -473,7 +475,7 @@ fn should_suppress_hotkey(state: &HookSharedState, hk: &HotkeyInfo) -> bool {
     let (fg_pid, own_pid): (u32, u32) = {
         #[cfg(test)]
         {
-            let injected = TEST_FOCUSED_PID.load(Ordering::Acquire);
+            let injected = TEST_FOCUSED_PID.with(|p| p.load(Ordering::Acquire));
             if injected != 0 {
                 (injected, state.own_pid)
             } else {
@@ -636,13 +638,13 @@ mod tests {
     struct FocusGuard(u32);
     impl FocusGuard {
         fn set(pid: u32) -> Self {
-            TEST_FOCUSED_PID.store(pid, Ordering::Release);
+            TEST_FOCUSED_PID.with(|p| p.store(pid, Ordering::Release));
             FocusGuard(pid)
         }
     }
     impl Drop for FocusGuard {
         fn drop(&mut self) {
-            TEST_FOCUSED_PID.store(0, Ordering::Release);
+            TEST_FOCUSED_PID.with(|p| p.store(0, Ordering::Release));
         }
     }
 
