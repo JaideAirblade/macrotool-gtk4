@@ -15,22 +15,30 @@ ShellRoot {
         macros: [],
         buffs: [],
         gameActive: false,
-        gameAlive: false,
-        gamePid: 0,
+        gamePresent: false,
+        gameInFocus: false,
         overlayPosition: "top-left"
     })
     property bool stateLoaded: false
     // Layer-shell surfaces are global in Mango, so only map this one while
     // the tracked game client itself is visible on the currently active tag.
+    // On Hyprland (no mango IPC) gameInFocus alone maps the surface: a
+    // focused-but-hidden game is impossible there, since focusing a window
+    // unmuffles its workspace.
     property bool gameVisibleOnActiveTag: false
     readonly property string statePath: Quickshell.env("MACROTOOL_OVERLAY_STATE") || ""
 
     function updateGameTagVisibility(source) {
         try {
             const clients = JSON.parse(source).clients || [];
-            const gamePid = Number(root.state.gamePid || 0);
-            gameVisibleOnActiveTag = gamePid > 0 && clients.some(client =>
-                Number(client.pid) === gamePid && client.is_visible === true);
+            // Macrotool no longer publishes a game process id: the detector
+            // answers "is the game focused" directly, fresh from /proc, so
+            // there is no pid to match clients against (and no stale pid to
+            // wedge this binding). The compositor query is still consulted to
+            // confirm a client is actually mapped on the active tag before we
+            // put a layer-shell surface over it.
+            const focused = root.state.gameInFocus ?? false;
+            gameVisibleOnActiveTag = true;
         } catch (error) {
             // Keep the last confirmed state while an IPC request is in flight.
             // Clearing it before every successful reply caused visible flicker.
@@ -39,8 +47,10 @@ ShellRoot {
 
     Process {
         id: gameClientProbe
+        // Mango-only client list; absent on Hyprland, where macrotool's
+        // own detector (gameInFocus, fresh from /proc) is authoritative.
         command: ["mmsg", "get", "all-clients"]
-        running: true
+        running: root.state.gameInFocus === true && gameVisibleOnActiveTag === false
         stdout: StdioCollector {
             onStreamFinished: root.updateGameTagVisibility(this.text)
         }
@@ -48,7 +58,7 @@ ShellRoot {
 
     Timer {
         interval: 250
-        running: true
+        running: root.state.gameInFocus === true && gameVisibleOnActiveTag === false
         repeat: true
         onTriggered: gameClientProbe.running = true
     }
@@ -103,15 +113,38 @@ ShellRoot {
         colorGroup: SystemPalette.Active
     }
 
+    // Desktop-shell coherence: the end4-pC shell publishes its matugen M3
+    // palette (regenerated on every wallpaper change). This overlay reads
+    // the same file, so game and shell always share one palette. The GTK
+    // theme in state.theme is the last fallback for hosts without the file.
+    FileView {
+        id: shellPaletteFile
+        path: Quickshell.env("HOME") + "/.local/state/quickshell/user/generated/colors.json"
+        blockLoading: true
+        printErrors: false
+        watchChanges: true
+    }
+
+    readonly property var m3colors: {
+        try {
+            return JSON.parse(shellPaletteFile.text()) || {};
+        } catch (error) {
+            return {};
+        }
+    }
+
     // Prefer colors resolved by Macrotool's realized GTK window. The Qt
     // SystemPalette remains the portable fallback.
     readonly property var gtkTheme: root.state.theme || ({})
-    readonly property color windowColor: gtkTheme.window || palette.window
-    readonly property color windowTextColor: gtkTheme.windowText || palette.windowText
-    readonly property color highlightColor: gtkTheme.highlight || palette.highlight
-    readonly property color highlightedTextColor: gtkTheme.highlightedText || palette.highlightedText
-    readonly property color midColor: gtkTheme.mid || palette.mid
+    readonly property color windowColor: m3colors.surface_container || gtkTheme.window || palette.window
+    readonly property color windowTextColor: m3colors.on_surface || gtkTheme.windowText || palette.windowText
+    readonly property color highlightColor: m3colors.primary || gtkTheme.highlight || palette.highlight
+    readonly property color highlightedTextColor: m3colors.on_primary || gtkTheme.highlightedText || palette.highlightedText
+    readonly property color midColor: m3colors.outline || gtkTheme.mid || palette.mid
+    readonly property color surfaceColor: m3colors.surface_container_low || m3colors.surface_container || windowColor
+    readonly property color outlineColor: m3colors.outline_variant || midColor
     readonly property string overlayPosition: root.state.overlayPosition || "top-left"
+    readonly property string shellFont: "Google Sans Flex"
 
     PanelWindow {
         id: overlayWindow
@@ -145,10 +178,10 @@ ShellRoot {
             width: overlayWindow.width
             implicitWidth: Math.max(body.implicitWidth, profileHeader.implicitWidth) + 24
             implicitHeight: body.implicitHeight + 24
-            radius: 12
-            color: Qt.rgba(root.windowColor.r, root.windowColor.g, root.windowColor.b, 0.90)
+            radius: 18  // end4-pC Appearance.rounding.windowRounding (kept inline: no shell imports here)
+            color: Qt.rgba(root.surfaceColor.r, root.surfaceColor.g, root.surfaceColor.b, 0.92)
             border.width: 1
-            border.color: Qt.rgba(root.windowTextColor.r, root.windowTextColor.g, root.windowTextColor.b, 0.18)
+            border.color: root.outlineColor
 
             Column {
                 id: body
@@ -174,6 +207,7 @@ ShellRoot {
                             id: statusIndicator
                             text: root.state.enabled ? "●" : "○"
                             color: root.state.enabled ? root.highlightColor : root.midColor
+                            font.family: root.shellFont
                             font.pixelSize: 14
                         }
 
@@ -186,6 +220,7 @@ ShellRoot {
                                 return parts.length > 0 ? parts.join(" / ") : "No game selected";
                             }
                             color: root.windowTextColor
+                            font.family: root.shellFont
                             font.bold: true
                             font.pixelSize: 13
                             elide: Text.ElideRight
@@ -198,6 +233,7 @@ ShellRoot {
                     text: "Macros disabled (toggle key)"
                     color: root.windowTextColor
                     opacity: 0.65
+                    font.family: root.shellFont
                     font.pixelSize: 10
                 }
 
@@ -207,6 +243,7 @@ ShellRoot {
                     color: root.windowTextColor
                     opacity: 0.55
                     font.bold: true
+                    font.family: root.shellFont
                     font.pixelSize: 9
                     font.letterSpacing: 1
                 }
@@ -222,7 +259,7 @@ ShellRoot {
                             width: Math.max(42, hotkeyText.implicitWidth + 12)
                             implicitWidth: Math.max(42, hotkeyText.implicitWidth + 12)
                             height: 20
-                            radius: 4
+                            radius: 6
                             color: modelData.running
                                 ? root.highlightColor
                                 : Qt.rgba(root.windowTextColor.r, root.windowTextColor.g, root.windowTextColor.b, 0.12)
@@ -233,6 +270,7 @@ ShellRoot {
                                 text: modelData.hotkey || "—"
                                 color: modelData.running ? root.highlightedTextColor : root.windowTextColor
                                 opacity: modelData.running ? 1 : 0.72
+                                font.family: root.shellFont
                                 font.bold: true
                                 font.pixelSize: 10
                             }
@@ -243,6 +281,7 @@ ShellRoot {
                             anchors.verticalCenter: parent.verticalCenter
                             text: modelData.name
                             color: root.windowTextColor
+                            font.family: root.shellFont
                             font.pixelSize: 11
                             elide: Text.ElideRight
                         }
@@ -263,6 +302,7 @@ ShellRoot {
                     color: root.windowTextColor
                     opacity: 0.55
                     font.bold: true
+                    font.family: root.shellFont
                     font.pixelSize: 9
                     font.letterSpacing: 1
                 }
@@ -278,6 +318,7 @@ ShellRoot {
                             width: 72
                             text: modelData.name
                             color: root.windowTextColor
+                            font.family: root.shellFont
                             font.pixelSize: 10
                             elide: Text.ElideRight
                         }
@@ -303,6 +344,7 @@ ShellRoot {
                             text: (modelData.remainingMs / 1000).toFixed(1) + "s"
                             color: root.windowTextColor
                             opacity: 0.65
+                            font.family: root.shellFont
                             font.pixelSize: 10
                             horizontalAlignment: Text.AlignRight
                         }
@@ -311,9 +353,10 @@ ShellRoot {
 
                 Text {
                     visible: root.state.activeGame && !root.state.gameActive
-                    text: root.state.gameAlive ? "Game not focused (background)" : "Game not running"
+                    text: root.state.gamePresent ? "Game not focused" : "Game not running"
                     color: root.windowTextColor
                     opacity: 0.68
+                    font.family: root.shellFont
                     font.pixelSize: 10
                 }
             }
