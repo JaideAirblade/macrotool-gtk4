@@ -738,8 +738,24 @@ pub fn get_foreground_window() -> WindowHandle {
 /// game detector calls it every 150ms. A slow Niri IPC round-trip here does
 /// NOT block the input hot path.
 pub fn refresh_foreground_cache() {
-    // Niri path first — it's the dominant case on the user's UwU host
-    // and the only one that works on pure-Wayland sessions.
+    // Hyprland path first — it is the compositor on UwU and the ONLY
+    // source that can see native-Wayland game windows. A Proton game
+    // launched with PROTON_ENABLE_WAYLAND=1 has no X11 window at all, so
+    // the X11 fallback below returns nothing (or worse, the last-active
+    // Xwayland window) and the suppression gate fails closed forever:
+    // macros silently never fire. Some(0) here is a TERMINAL answer
+    // (Hyprland alive, nothing focused) — do NOT fall through to X11 in
+    // that case; xwayland-satellite's _NET_ACTIVE_WINDOW would report a
+    // stale X window as "focused" and lie about focus.
+    if let Some(pid) = hyprland_foreground_pid() {
+        if pid != CACHED_FOCUSED_PID.load(Ordering::Acquire) {
+            log::debug!("[linux] focus -> {} (hyprland)", pid);
+        }
+        CACHED_FOCUSED_PID.store(pid, Ordering::Release);
+        return;
+    }
+    // Niri path — the dominant case on Niri hosts and the only other one
+    // that works on pure-Wayland sessions.
     if let Some(pid) = niri_foreground_pid() {
         if pid != CACHED_FOCUSED_PID.load(Ordering::Acquire) {
             log::debug!("[linux] focus -> {} (niri)", pid);
@@ -768,6 +784,134 @@ pub fn refresh_foreground_cache() {
 /// `refresh_foreground_cache()` and read by `get_foreground_window() at
 /// every key event. Atomic load makes the hot path lock-free.
 static CACHED_FOCUSED_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Resolve the focused window PID via Hyprland's IPC socket.
+///
+/// Hyprland exposes a command socket at
+/// `/run/user/<uid>/hypr/<signature>/.socket.sock`. We send `j/activewindow`
+/// and parse the JSON `{"pid": <u32>, ...}` reply (same field niri reports,
+/// so the game matching in check_window works unchanged — including Wine
+/// cmdlines like `..\bin64\Client.exe` via the filename fallback).
+///
+/// Returns:
+///   Some(pid) — Hyprland answered with a focused window (pid > 0). This
+///               is the ONLY source that can see native-Wayland game
+///               windows (PROTON_ENABLE_WAYLAND=1 has no X11 window).
+///   Some(0)   — Hyprland answered "no window focused". TERMINAL answer:
+///               a live compositor with nothing focused must NOT fall
+///               through to X11, where xwayland-satellite's
+///               _NET_ACTIVE_WINDOW can report a stale X window and lie
+///               about focus.
+///   None      — No Hyprland (socket absent/unreachable/timed out). The
+///               caller may try niri/X11.
+fn hyprland_foreground_pid() -> Option<u32> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let socket = match hyprland_socket_path() {
+        Some(s) => s,
+        None => {
+            log::debug!("[linux] hyprland: no socket path found");
+            return None;
+        }
+    };
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(s) => s,
+        Err(e) => {
+            // Stale signature dir left by a crashed Hyprland instance.
+            log::debug!("[linux] hyprland connect failed ({:?}): {}", socket, e);
+            return None;
+        }
+    };
+    // Bound the whole exchange so a wedged compositor can't stall the
+    // detector tick (same budget as the niri path's 100 ms cap).
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    if let Err(e) = stream.write_all(b"j/activewindow") {
+        log::debug!("[linux] hyprland: write failed: {}", e);
+        return None;
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Hyprland closes the connection after the reply, so read to EOF.
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 256 * 1024 {
+                    break; // sanity cap on a misbehaving reply
+                }
+            }
+            Err(e) => {
+                log::debug!("[linux] hyprland: read failed: {}", e);
+                return None;
+            }
+        }
+    }
+    if buf.is_empty() {
+        log::debug!("[linux] hyprland: empty reply");
+        return None;
+    }
+    Some(parse_hyprland_activewindow(&buf))
+}
+
+/// Parse the `j/activewindow` reply. Anything that is not a window object
+/// with a pid maps to 0 ("focused window unknown"), which the refresh
+/// chain treats as a terminal fail-closed answer.
+fn parse_hyprland_activewindow(reply: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(reply);
+    let trimmed = text.trim();
+    // Hyprland replies with the bare word `Invalid` when no window is
+    // focused (workspace transition, fresh session with only layer-shell
+    // surfaces mapped, etc.).
+    if trimmed.is_empty() || trimmed == "Invalid" || trimmed == "ok" {
+        return 0;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|j| j.get("pid").and_then(|p| p.as_u64()))
+        .map(|p| p as u32)
+        .unwrap_or(0)
+}
+
+/// Locate the live Hyprland IPC socket.
+///
+/// Preference order:
+///   1. `$HYPRLAND_INSTANCE_SIGNATURE` (set for Hyprland's children) —
+///      only if that socket actually exists. Not all launch paths set it
+///      (macrotool's session env doesn't), so the scan below is the
+///      workhorse.
+///   2. Newest `/run/user/<uid>/hypr/*/.socket.sock` by mtime. Hyprland
+///      removes its socket on clean exit, but a crashed instance can
+///      leave a stale signature dir behind; the mtime sort puts the live
+///      instance first and the caller's connect() skips dead ones.
+fn hyprland_socket_path() -> Option<PathBuf> {
+    let uid = unsafe { libc::getuid() };
+
+    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        if !sig.is_empty() && !sig.contains('/') {
+            let p = PathBuf::from(format!("/run/user/{}/hypr/{}/.socket.sock", uid, sig));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    let dir = PathBuf::from(format!("/run/user/{}/hypr", uid));
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let sock = entry.path().join(".socket.sock");
+        let mtime = match std::fs::metadata(&sock).ok().and_then(|m| m.modified().ok()) {
+            Some(t) if sock.exists() => t,
+            _ => continue,
+        };
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, sock));
+        }
+    }
+    best.map(|(_, p)| p)
+}
 
 /// Resolve the focused window PID via Niri's IPC socket.
 ///
@@ -1599,7 +1743,7 @@ pub struct RECT {
 
 #[cfg(test)]
 mod tests {
-    use super::{grabbed_event_route, process_path_from_cmdline, EventRoute};
+    use super::{grabbed_event_route, parse_hyprland_activewindow, process_path_from_cmdline, EventRoute};
 
     #[test]
     fn hybrid_primary_mouse_button_uses_mouse_route() {
@@ -1675,5 +1819,31 @@ mod tests {
         remember(&p, "", "", "uinput-device");
         assert!(check(&p, "", "", "uinput-device"));
         assert!(!check(&p, "real-uniq", "", "uinput-device"));
+    }
+
+    // ── Hyprland focus source ──────────────────────────────────────────
+
+    #[test]
+    fn hyprland_parses_real_activewindow_reply() {
+        // Shape captured from the live socket on UwU (Hyprland 0.56,
+        // j/activewindow, 2026-09-25). Field order and extra keys vary;
+        // only "pid" matters.
+        let reply = br#"{"address":"0x5fc4e9a89c00","mapped":true,"hidden":false,"visible":true,"acceptsInput":true,"at":[14,59],"size":[3412,1367],"workspace":{"id":3,"name":"3"},"floating":false,"monitor":0,"class":"vesktop","title":"Discord","initialClass":"vesktop","initialTitle":"Discord","pid":2505633,"xwayland":false,"pinned":false}"#;
+        assert_eq!(parse_hyprland_activewindow(reply), 2505633);
+    }
+
+    #[test]
+    fn hyprland_invalid_and_empty_replies_map_to_zero() {
+        // No window focused / protocol-level N/A → terminal 0, never a
+        // fall-through to the X11 fallback.
+        assert_eq!(parse_hyprland_activewindow(b"Invalid"), 0);
+        assert_eq!(parse_hyprland_activewindow(b""), 0);
+        assert_eq!(parse_hyprland_activewindow(b"ok"), 0);
+    }
+
+    #[test]
+    fn hyprland_garbage_reply_maps_to_zero_not_panic() {
+        assert_eq!(parse_hyprland_activewindow(b"<<<garbage>>>"), 0);
+        assert_eq!(parse_hyprland_activewindow(b"{\"no_pid\":1}"), 0);
     }
 }
