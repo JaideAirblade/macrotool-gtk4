@@ -886,12 +886,56 @@ fn parse_hyprland_activewindow(reply: &[u8]) -> u32 {
 ///      removes its socket on clean exit, but a crashed instance can
 ///      leave a stale signature dir behind; the mtime sort puts the live
 ///      instance first and the caller's connect() skips dead ones.
+/// Public resolver for the Hyprland event socket (`.socket2.sock`).
+/// Shares the same last-known-good cache logic as the query socket, so a
+/// transient rescan failure cannot blind either stream.
+pub fn hyprland_event_socket_path() -> Option<PathBuf> {
+    hyprland_socket_path_for(".socket2.sock")
+}
+
 fn hyprland_socket_path() -> Option<PathBuf> {
+    hyprland_socket_path_for(".socket.sock")
+}
+
+/// Shared resolver for both Hyprland sockets (`.socket.sock` for queries,
+/// `.socket2.sock` for the event stream). Two-level:
+///   1. A last-known-good cache: once a socket path has resolved, keep
+///      returning it as long as the file still exists. The rescan
+///      previously ran on EVERY call (every 150 ms + every event) and on
+///      UwU was observed to transiently fail for multi-minute stretches
+///      ("hyprland: no socket path found" × 59 back to back in the debug
+///      log) while the live socket was right there — macrotool was blind
+///      the whole time. Caching short-circuits whatever transient failure
+///      produced that.
+///   2. `$HYPRLAND_INSTANCE_SIGNATURE` honour, then newest-mtime rescan.
+fn hyprland_socket_path_for(name: &str) -> Option<PathBuf> {
+    use std::sync::Mutex as StdMutex;
+    static CACHE: StdMutex<Option<(String, PathBuf)>> = StdMutex::new(None);
+
+    {
+        let c = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_name, cached_path)) = c.as_ref() {
+            if cached_name == name && cached_path.exists() {
+                return Some(cached_path.clone());
+            }
+        }
+        drop(c);
+    }
+
+    let resolved = hyprland_socket_path_uncached(name);
+    if let Some(p) = &resolved {
+        let mut c = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        *c = Some((name.to_string(), p.clone()));
+    }
+    resolved
+}
+
+fn hyprland_socket_path_uncached(name: &str) -> Option<PathBuf> {
     let uid = unsafe { libc::getuid() };
 
     if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
         if !sig.is_empty() && !sig.contains('/') {
-            let p = PathBuf::from(format!("/run/user/{}/hypr/{}/.socket.sock", uid, sig));
+            let p = PathBuf::from(format!("/run/user/{}/hypr/{}/{}", uid, sig, name));
             if p.exists() {
                 return Some(p);
             }
@@ -901,7 +945,7 @@ fn hyprland_socket_path() -> Option<PathBuf> {
     let dir = PathBuf::from(format!("/run/user/{}/hypr", uid));
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let sock = entry.path().join(".socket.sock");
+        let sock = entry.path().join(name);
         let mtime = match std::fs::metadata(&sock).ok().and_then(|m| m.modified().ok()) {
             Some(t) if sock.exists() => t,
             _ => continue,

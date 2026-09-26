@@ -141,14 +141,15 @@ impl GameDetector {
     pub fn start(self: &Arc<Self>, cfg: Arc<config::Manager>) {
         let detector1 = self.clone();
         let detector2 = self.clone();
+        let detector3 = self.clone();
         let cfg_for_poll = cfg.clone();
         let cfg_for_event = cfg.clone();
+        let cfg_for_hypr = cfg.clone();
 
-        // Event-stream thread: instant focus tracking. Every time Niri
-        // emits a focus/window/workspace event we refresh the foreground
-        // cache, and (because the event carries the new pid directly) we
-        // also run the matching check_window path inline so game_pid is
-        // updated on the same instant the user clicked.
+        // Event-stream thread (Niri): instant focus tracking. Every time
+        // Niri emits a focus/window/workspace event we refresh the
+        // foreground cache and run a full detector tick inline, so game_pid
+        // is updated on the same instant the user clicked.
         thread::Builder::new()
             .name("game-detect-event".into())
             .spawn(move || {
@@ -164,14 +165,31 @@ impl GameDetector {
             })
             .expect("spawn game-detect-event thread");
 
-        // Poll thread: once-a-second fallback. Runs the full detector
-        // (cfg + Wine-cmdline scan) so a missed event doesn't strand us
-        // in a stale state.
+        // Event-stream thread (Hyprland): .socket2.sock pushes
+        // `activewindow>>…` / `closewindow>>…` / `openwindow>>…` lines.
+        // On Hyprland hosts the niri thread above never finds a socket and
+        // idles in the 2 s backoff; this thread is the one doing the work.
+        thread::Builder::new()
+            .name("game-detect-hyprland".into())
+            .spawn(move || loop {
+                if detector3.run_hyprland_event_iteration(cfg_for_hypr.clone()) {
+                    std::thread::sleep(Duration::from_millis(50));
+                } else {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            })
+            .expect("spawn game-detect-hyprland thread");
+
+        // Poll thread: 150 ms baseline. This is the floor the suppression
+        // gate and the overlay see when the event streams above are
+        // unavailable (compositor restart, headless, or a WM we have no
+        // stream for yet); 1 Hz polling was the visible "focus is slow"
+        // regression.
         thread::Builder::new()
             .name("game-detect-poll".into())
             .spawn(move || loop {
                 detector2.check_window(&cfg_for_poll);
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(150));
             })
             .expect("spawn game-detect-poll thread");
     }
@@ -263,6 +281,86 @@ impl GameDetector {
         }
     }
 
+    /// Subscribe to Hyprland's event socket (`.socket2.sock`) and run a
+    /// detector tick for every focus/window event. Returns true if a
+    /// stream was connected and consumed at least one event; false means
+    /// "no Hyprland here" or a dead connection, so the caller can back off.
+    ///
+    /// Wire format (verified against Hyprland 0.56.2 on UwU): newline-
+    /// terminated ASCII records, event name and payload separated by `>>`:
+    ///   activewindow>>class,title
+    ///   activewindowv2>>address
+    ///   closewindow>>address
+    ///   openwindow>>address,workspace,class,title
+    ///   movewindow>>…, changefloatingmode>>…, urgent>>… (ignored)
+    fn run_hyprland_event_iteration(&self, cfg: Arc<crate::config::Manager>) -> bool {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+
+        let socket = match hyprland_event_socket_path() {
+            Some(p) => p,
+            None => return false,
+        };
+        let stream = match UnixStream::connect(&socket) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("[detect] hyprland socket2 connect failed: {}", e);
+                return false;
+            }
+        };
+        // Hyprland never closes the stream on its own; if the compositor
+        // restarts the socket inode goes away and read_line returns EOF.
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let mut saw_event = false;
+
+        loop {
+            line.clear();
+            let n = match reader.read_line(&mut line) {
+                Ok(0) => {
+                    log::warn!("[detect] hyprland event-stream EOF — reconnect in 2s");
+                    return saw_event;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("[detect] hyprland event-stream read error: {}", e);
+                    return saw_event;
+                }
+            };
+            if n == 0 {
+                continue;
+            }
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            // Cheap filter: only focus-relevant events justify a full tick.
+            let head = t.split(">>").next().unwrap_or("");
+            if matches!(
+                head,
+                "activewindow" | "activewindowv2" | "openwindow" | "closewindow"
+                    | "movewindow" | "workspace"
+            ) {
+                saw_event = true;
+
+                // The instant path — a full detector tick, same behaviour
+                // as the niri event thread. Cost ~1 ms (Hyprland IPC +
+                // readdir on /proc when the fallback fires).
+                self.check_window(&cfg);
+
+                // Hyprland additionally tells us the class directly, which
+                // is the most robust native-Wayland signal available. Log
+                // it (rate-limited by check_window's own 5 s writer) so a
+                // future regression is easy to spot in
+                // /tmp/macrotool-detector.log.
+                if head == "activewindow" || head == "activewindowv2" {
+                    let payload = t.split(">>").nth(1).unwrap_or("");
+                    log::debug!("[detect] hyprland focus event: {}", payload);
+                }
+            }
+        }
+    }
+
     /// Locate the live Niri IPC socket. Honours `$NIRI_SOCKET` first;
     /// falls back to scanning `/run/user/$UID/` for a working socket
     /// (skipping stale symlinks whose target has been deleted).
@@ -334,14 +432,26 @@ impl GameDetector {
             .map(|p| paths_match(&game_path, p))
             .unwrap_or(false);
 
-        // Niri + Heroic/Wine/Proton fallback: when the foreground PID is
-        // xwayland-satellite, its own /proc cmdline has nothing useful
-        // (X clients connect via socket, not fork). Walk every /proc entry
-        // looking for a process whose cmdline ends in the configured
-        // Windows .exe. If we find one, treat the foreground window as
-        // the game — the user has the game focused, just via the
-        // satellite wrapper.
-        if !matched {
+        // XWayland fallback: when the foreground PID is xwayland-satellite,
+        // its own /proc cmdline has nothing useful (X clients connect via
+        // socket, not fork). Only then scan every /proc entry for a process
+        // whose cmdline ends in the configured Windows .exe.
+        //
+        // CRITICAL gate (regression 2026-09-26): this fallback previously
+        // fired whenever the direct match failed, so ANY running Client.exe
+        // anywhere on the system flipped matched=true even while focus sat
+        // on foot/Helium/Discord. The log then showed matched=true with
+        // proc_path=Some("foot") — the overlay said "game in focus", the
+        // suppression gate opened, and macros fired into chat. Restrict the
+        // scan to the cases it was designed for:
+        //   fg_pid == 0        focus unknown (fail-closed would strand a
+        //                      native-Wayland game whose IPC tick failed)
+        //   proc_path == None  foreground path unreadable (zombie/race/perm)
+        //   satellite/wine     the XWayland router or a wine loader holds
+        //                      the window; the real .exe is elsewhere
+        // Anything else (foot, helium, discord, …) means the user is NOT
+        // in the game: close the gate.
+        if !matched && fg_pid_may_host_game(fg_pid, proc_path.as_deref()) {
             let scan_result = scan_wine_process_for_game(&game_path);
             log::info!(
                 "[game] scan_wine_process_for_game: game_path={:?} result={:?}",
@@ -382,9 +492,19 @@ impl GameDetector {
                     matched,
                     own_pid
                 );
-                let _ = std::fs::write("/tmp/macrotool-detector.log",
-                    std::fs::read_to_string("/tmp/macrotool-detector.log")
-                        .unwrap_or_default() + &line);
+                // Append in-place (O(line)) instead of read+rewrite (O(file)).
+                // At ~150ms tick this block fires every 5s and the log grew
+                // into the multi-MB range; rewriting the whole file each
+                // tick is the exact kind of slow that shows up as "detector
+                // feels sluggish" once the file is big.
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/macrotool-detector.log")
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
             }
         }
 
@@ -486,6 +606,60 @@ fn paths_match(configured: &str, actual: &str) -> bool {
     !c_file.is_empty() && c_file == a_file
 }
 
+/// Decide whether the foreground PID is allowed to use the
+/// `scan_wine_process_for_game` /proc-wide fallback. The fallback exists
+/// for exactly one scenario: the compositor reported an XWayland-routed
+/// game window, so the foreground PID is the satellite (or a wine loader),
+/// and the real game process sits somewhere else. It must NEVER fire when
+/// the focused process is positively identified as something else
+/// (foot, helium, discord) — that is the "macros bleed into chat" bug.
+fn fg_pid_may_host_game(fg_pid: u32, proc_path: Option<&str>) -> bool {
+    // Focus unknown: the compositor could not name a foreground pid. One
+    // bad IPC tick must not strand a native-Wayland game (its own pid path
+    // is the only path that works there). Fail open — the suppression gate
+    // fails closed on its own when focus is unknown; this only gates the
+    // scan.
+    if fg_pid == 0 {
+        return true;
+    }
+    let path = match proc_path {
+        None => return true, // unreadable (zombie/race/perm) — treat like unknown
+        Some(p) => p,
+    };
+    // Normalize: lowercase, split on both separators, keep basename.
+    let lower = path.to_ascii_lowercase();
+    let base = lower
+        .rsplit(|c: char| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(&lower);
+    // XWayland routing wrappers and wine loaders are allowed to proxy the
+    // game. Everything else means "focus is on a real other application".
+    //
+    // Exact match per name; the only prefix case is "wine" whose suffixed
+    // loader binaries (wine-preloader, wine64-preloader, wineserver*…) are
+    // enumerated explicitly below so a hypothetical "winetricks-gui" can
+    // NOT slip through the prefix arm.
+    const ALLOWED_EXACT: &[&str] = &[
+        "xwayland-satellite",
+        "xwayland",
+        "wine",
+        "wine64",
+        "wine-preloader",
+        "wine64-preloader",
+        "wineserver",
+        "services.exe", // proton loader chain
+        "explorer.exe", // proton virtual desktop wrapper
+    ];
+    ALLOWED_EXACT.iter().any(|a| base == *a)
+}
+
+/// Locate the Hyprland event socket (`.socket2.sock`). Thin wrapper over
+/// the shared, last-known-good cached resolver in platform/linux.rs so a
+/// transient rescan failure does not blind the detector for minutes.
+fn hyprland_event_socket_path() -> Option<std::path::PathBuf> {
+    platform::hyprland_event_socket_path()
+}
+
 /// Scan every /proc entry looking for a Wine/Proton game process whose
 /// cmdline ends in the configured Windows .exe. Used as a fallback when
 /// the foreground window's own /proc lookup doesn't yield a useful path
@@ -556,4 +730,107 @@ fn scan_wine_process_for_game(configured: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── fg_pid_may_host_game ────────────────────────────────────────────
+    //
+    // The /proc-wide fallback must never fire when the foreground process
+    // is positively identified as a non-game app — that was the
+    // matched=true-on-foot bug from 2026-09-26.
+
+    #[test]
+    fn fg_fallback_allows_unknown_focus() {
+        // The compositor could not name a pid: one bad IPC tick must not
+        // strand a native-Wayland game.
+        assert!(fg_pid_may_host_game(0, None));
+        assert!(fg_pid_may_host_game(0, Some("")));
+    }
+
+    #[test]
+    fn fg_fallback_allows_xwayland_satellite() {
+        // proc_path for the satellite arrives as either bare comm or the
+        // full exe path (no argv tail — query_process_path picks the
+        // first arg or an .exe, both are clean basenames here).
+        assert!(fg_pid_may_host_game(4321, Some("xwayland-satellite")));
+        assert!(fg_pid_may_host_game(4321, Some("/run/current-system/sw/bin/xwayland-satellite")));
+        assert!(fg_pid_may_host_game(4321, Some("Xwayland")));
+    }
+
+    #[test]
+    fn fg_fallback_allows_wine_loaders() {
+        assert!(fg_pid_may_host_game(10341, Some("wine")));
+        assert!(fg_pid_may_host_game(10341, Some("wine64")));
+        assert!(fg_pid_may_host_game(10341, Some("/usr/lib/wine/wine-preloader")));
+        assert!(fg_pid_may_host_game(10341, Some("C:\\windows\\system32\\explorer.exe")));
+    }
+
+    #[test]
+    fn fg_fallback_denies_other_apps() {
+        // The regression: focused process is foot / helium / discord.
+        // The fallback must NOT flip matched=true while the user types.
+        assert!(!fg_pid_may_host_game(13163, Some("foot")));
+        assert!(!fg_pid_may_host_game(
+            4148,
+            Some("/nix/store/kfisj4znv53lbkgdkm547layq53y977c-helium-bin-0.18.1.1/lib/helium/helium")
+        ));
+        assert!(!fg_pid_may_host_game(99, Some("discord")));
+        assert!(!fg_pid_may_host_game(99, Some("/run/current-system/sw/bin/firefox")));
+    }
+
+    #[test]
+    fn fg_fallback_denies_wine_prefix_lookalikes() {
+        // The exact-match fix (2026-09-26 review nit): a hypothetical
+        // binary whose name merely starts with a loader name must NOT
+        // pass the gate.
+        assert!(!fg_pid_may_host_game(4242, Some("winetricksgui")));
+        assert!(!fg_pid_may_host_game(4242, Some("wine-something")));
+        assert!(!fg_pid_may_host_game(4242, Some("wine-server"))); // dash, not prefix
+        assert!(!fg_pid_may_host_game(4242, Some("xwayland-satellite-backup")));
+    }
+
+    #[test]
+    fn fg_fallback_denies_when_path_resolves_to_game_name() {
+        // A positive identification of ANY named process — including the
+        // game's own basename reaching the fallback by an unusual path —
+        // must close the gate. The /proc scan would happily match any
+        // OTHER Client.exe on the system.
+        assert!(!fg_pid_may_host_game(
+            10341,
+            Some("..\\bin64\\Client.exe"),
+        ));
+    }
+
+    #[test]
+    fn fg_fallback_handles_windows_separators() {
+        // proc_path arrives raw from a wine cmdline, with backslashes.
+        // Note: input here is a single arg already — query_process_path
+        // picks argv[0] (or the first .exe), no trailing " /desktop=…".
+        assert!(fg_pid_may_host_game(4321, Some("Z:\\nix\\store\\xwayland-satellite\\bin\\xwayland-satellite")));
+        assert!(!fg_pid_may_host_game(9999, Some("C:\\users\\jaide\\AppData\\discord\\app-1.0\\Discord.exe")));
+        // Case-insensitivity.
+        assert!(fg_pid_may_host_game(4321, Some("XWAYLAND-SATELLITE")));
+        assert!(!fg_pid_may_host_game(9999, Some("FOOT")));
+    }
+
+    // ── paths_match (smoke: unchanged behaviour) ────────────────────────
+
+    #[test]
+    fn paths_match_basename_handles_windows_separators() {
+        assert!(paths_match(
+            "/home/jaide/Games/…/bin64/Client.exe",
+            "..\\bin64\\Client.exe"
+        ));
+    }
+
+    #[test]
+    fn paths_match_rejects_other_exes() {
+        assert!(!paths_match(
+            "/home/jaide/Games/…/bin64/Client.exe",
+            "/usr/bin/foot"
+        ));
+    }
 }
