@@ -431,6 +431,11 @@ impl GameDetector {
             .as_ref()
             .map(|p| paths_match(&game_path, p))
             .unwrap_or(false);
+        // PID found by the /proc-wide fallback (fg_pid may be 0 when the
+        // compositor could not name the foreground window - niri under
+        // load). Needed so the suppression gate has a real game pid to
+        // check instead of failing closed forever.
+        let mut scanned_game_pid: Option<u32> = None;
 
         // XWayland fallback: when the foreground PID is xwayland-satellite,
         // its own /proc cmdline has nothing useful (X clients connect via
@@ -458,13 +463,15 @@ impl GameDetector {
                 game_path,
                 scan_result
             );
-            if let Some(wine_path) = scan_result {
+            if let Some((scanned_pid, wine_path)) = scan_result {
                 log::info!(
-                    "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {}",
+                    "[game] foreground PID {} (xwayland-satellite?) matched via Wine child cmdline {} (scanned pid {})",
                     fg_pid,
-                    wine_path
+                    wine_path,
+                    scanned_pid
                 );
                 matched = true;
+                scanned_game_pid = Some(scanned_pid);
             }
         }
 
@@ -509,7 +516,10 @@ impl GameDetector {
         }
 
         if matched {
-            self.game_pid.store(fg_pid, Ordering::Release);
+            self.game_pid.store(
+                scanned_game_pid.unwrap_or(fg_pid),
+                Ordering::Release,
+            );
             self.game_alive.store(true, Ordering::Release);
             let old = self.window_active.swap(true, Ordering::AcqRel);
             let old_fg = self.game_foreground.swap(true, Ordering::AcqRel);
@@ -671,7 +681,7 @@ fn hyprland_event_socket_path() -> Option<std::path::PathBuf> {
 ///
 /// Cost: one readdir on /proc per 150ms detector tick (~few hundred
 /// entries, ~1ms total). Acceptable for a low-frequency poll thread.
-fn scan_wine_process_for_game(configured: &str) -> Option<String> {
+fn scan_wine_process_for_game(configured: &str) -> Option<(u32, String)> {
     let configured_basename = std::path::Path::new(configured)
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
@@ -726,7 +736,7 @@ fn scan_wine_process_for_game(configured: &str) -> Option<String> {
             .unwrap_or(&lowercase)
             .to_string();
         if basename == configured_basename {
-            return Some(path);
+            return Some((pid, path));
         }
     }
     None
